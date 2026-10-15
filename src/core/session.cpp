@@ -2,6 +2,7 @@
 #include "strata/core/session.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/ring_wait.hpp"
 
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -942,6 +943,7 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
     for (int64_t l = 0; l < g.n_layers; ++l) {
         const uint32_t want = (uint32_t) (l + 1);
         const auto t0 = Clock::now();
+        strata::core::RingWait ring(strata::core::progress_now_ms());
         auto last_flush = t0;
         uint32_t spins = 0;
         progress_at("token: waiting for the GPU to reach layer", l);
@@ -960,7 +962,7 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
                     return false;
                 }
             }
-            if (now - t0 > std::chrono::seconds(20)) {
+            if (ring.should_fire(strata::core::progress_now_ms())) {
                 err = "session_run_token: timed out waiting for layer " + std::to_string(l);
                 return false;
             }

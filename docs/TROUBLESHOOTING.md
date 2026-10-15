@@ -185,9 +185,13 @@ in order, one at a time, and tell us what changed:
 See [AMD_HIP.md](AMD_HIP.md#model-and-serving-configuration): the mapped expert mode avoids the full pinned arena.
 
 **"verify: timed out at layer N" or "no progress for 60 s" on AMD (Linux), mostly with `--mmap-experts`.**
-Two reports fixed it with `"GPU_PINNED_MIN_XFER_SIZE": "1048576"` (RX 6800) or `"HSA_USERPTR_FOR_PAGED_MEM": "0"` (two
-R9700) in the `env` block of the server JSON, then a restart. Experimental, one machine each; on a systemd unit use
-`MemoryMax`, not `MemoryHigh`. Details: [AMD_HIP.md](AMD_HIP.md#linux-verify-timeouts-while-the-kernel-reclaims-host-memory-experimental-workarounds).
+A timeout whose engine log counts file-tier I/O for the request (the "file tier I/O this request" line) is slow storage
+meeting the doorbell limit, not a hang: the verify window's doorbell waits follow the "no progress" watchdog's rule and
+hold on while the OS is still reading, up to 200 s per doorbell (`STRATA_RING_IO_S` sets it, 0 turns the allowance off;
+`STRATA_RING_TIMEOUT_S` raises the 20 s limit itself). A late doorbell with the disk quiet is still a hang and still ends
+the engine. Two reports fixed the remaining timeouts with `"GPU_PINNED_MIN_XFER_SIZE": "1048576"` (RX 6800) or
+`"HSA_USERPTR_FOR_PAGED_MEM": "0"` (two R9700) in the `env` block of the server JSON, then a restart. Experimental, one
+machine each; on a systemd unit use `MemoryMax`, not `MemoryHigh`. Details: [AMD_HIP.md](AMD_HIP.md#linux-verify-timeouts-while-the-kernel-reclaims-host-memory-experimental-workarounds).
 
 ## Still stuck?
 

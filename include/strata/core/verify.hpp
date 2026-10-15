@@ -25,6 +25,7 @@
 
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
+#include "strata/core/ring_wait.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
 
@@ -345,6 +346,7 @@ private:
     bool b_running_ = false;
     int64_t b_k_ = 0, b_steps_ = 0;
     std::chrono::steady_clock::time_point b_last_;
+    strata::core::RingWait b_ring_;   ///< the batch poll's doorbell wait (reset wherever b_last_ is)
     int32_t b_out_[8] = {};
     std::vector<strata::kernels::SamplerParams> slot_sp_;
     bool sample_rows(int S, std::string& err);   ///< the sampled slots' rows of the last batch window
@@ -373,6 +375,7 @@ private:
     int fl_T_ = 0;
     int64_t fl_k_ = 0, fl_total_ = 0;
     double fl_since_ms_ = 0, fl_flush_ms_ = 0, fl_launch_ms_ = 0;
+    strata::core::RingWait fl_ring_;   ///< the pipelined windows' doorbell wait (reset wherever fl_since_ms_ is)
     int32_t pl_prev_[2] = {-1, -1};
     std::vector<uint32_t> pl_ple_rows_;   ///< the window's PLE rows (T x PLE_N_HEADS), gathered when layer 0 is served
     bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);

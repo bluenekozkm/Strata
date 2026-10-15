@@ -247,7 +247,9 @@ A `verify: timed out at layer N` or "no progress for 60 s" message does not by i
 community reports found the same mechanism: the GPU's queues are suspended while the kernel reclaims host pages the GPU
 has pinned through a KFD userptr, and a restore that keeps returning `-EAGAIN` leaves them suspended for tens of seconds.
 Each report is one machine, one workaround, and the cause is not confirmed on either; neither is a default or a general
-speed claim, and neither is known to matter on Windows or on other ROCm versions.
+speed claim, and neither is known to matter on Windows or on other ROCm versions. The engine's doorbell waits also hold
+on while the file tier is being read (up to `STRATA_RING_IO_S`, 200 s; the "no progress" watchdog's rule), so a timeout
+whose log still counts file-tier I/O points at a queue suspension like these, not at slow storage alone.
 
 - **Paged host allocations (#750, two Radeon AI PRO R9700, ROCm 7.2):** tracing correlated a timeout with about 31 s of
   USERPTR queue suspension on both cards. ROCr uses USERPTR for paged host allocations unless `HSA_USERPTR_FOR_PAGED_MEM=0`.

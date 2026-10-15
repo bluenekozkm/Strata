@@ -2,6 +2,7 @@
 #include "strata/core/batch_rows.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/ring_wait.hpp"
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
 #include "strata/core/host_graph_launch.hpp"
 #endif
@@ -2215,14 +2216,16 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
 }
 
 // 0.1.43 (STRATA_ADAPT_OVERLAP): hold the host until the adaptive tier's copies up to `layer` have landed.  The wait
-// is a spin on an atomic the copy stream's host functions raise (no driver call here); 20 s is the window's own limit.
+// is a spin on an atomic the copy stream's host functions raise (no driver call here); the ring limit (#267) with its
+// slow-storage allowance (ring_wait.hpp) bounds it.
 bool Verifier::adapt_gate_wait(int32_t layer, std::string& err) {
     const Clock::time_point t0 = Clock::now();
     uint32_t spins = 0;
+    strata::core::RingWait ring(strata::core::progress_now_ms());
     while (adapt_gate_->reached() < layer) {
         _mm_pause();
         if ((++spins & 1023u) != 0) continue;
-        if (Clock::now() - t0 > std::chrono::seconds(20)) {
+        if (ring.should_fire(strata::core::progress_now_ms())) {
             err = "verify: the adaptive tier's copies for layer " + std::to_string(layer) + " never landed" +
                   released_note(release_gpu_waits(5000));
             return false;
@@ -2316,6 +2319,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         const int grp = (int) (k % G);
         const uint32_t want = (uint32_t) (k + 1);
         const Clock::time_point a = Clock::now();
+        strata::core::RingWait ring(strata::core::progress_now_ms());
         auto last_flush = a;
         uint32_t spins = 0;
         progress_at("verify window: waiting for the GPU to reach layer", l);
@@ -2338,7 +2342,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                     return false;
                 }
             }
-            if (now - a > std::chrono::seconds(20)) {
+            if (ring.should_fire(strata::core::progress_now_ms())) {
                 // #267: the caller ends the engine; no spin kernel may outlive it
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
                 trace_ev("TIMEOUT", k, l, (int64_t) launch.query());
@@ -3059,6 +3063,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         const int64_t l = lb_ + k;
         const uint32_t want = (uint32_t) (k + 1);
         const Clock::time_point a = Clock::now();
+        strata::core::RingWait ring(strata::core::progress_now_ms());
         auto last_flush = a;
         uint32_t spins = 0;
         progress_at("verify batch: waiting for the GPU to reach layer", l);
@@ -3075,7 +3080,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
                     return false;
                 }
             }
-            if (now - a > std::chrono::seconds(20)) {
+            if (ring.should_fire(strata::core::progress_now_ms())) {
                 err = "verify batch: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
                 return false;
             }
@@ -3201,6 +3206,7 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     b_k_ = 0;
     b_steps_ = le_ - lb_;
     b_last_ = Clock::now();
+    b_ring_.reset(strata::core::progress_now_ms());
     return true;
 }
 
@@ -3230,7 +3236,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
                     b_running_ = false;
                     return -1;
                 }
-                if (now - b_last_ > std::chrono::seconds(20)) {
+                if (b_ring_.should_fire(strata::core::progress_now_ms())) {
                     err = "verify batch: timed out at layer " + std::to_string(lb_ + b_k_) + released_note(release_gpu_waits(5000));
                     b_running_ = false;
                     return -1;
@@ -3260,6 +3266,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         *(volatile uint32_t*) h_flag_ = want;
         ms_pool += ms_since(b);
         b_last_ = Clock::now();
+        b_ring_.reset(strata::core::progress_now_ms());
         ++b_k_;
     }
     const cudaError_t q = cudaStreamQuery(cs_);
@@ -3454,6 +3461,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     (void) cudaStreamQuery(cs_);   // WDDM: submit now
     fl_active_ = true;
     fl_since_ms_ = fl_flush_ms_ = fl_launch_ms_ = now_ms();
+    fl_ring_.reset((int64_t) fl_since_ms_);
     return true;
 }
 
@@ -3467,7 +3475,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
     // on it (0.1.41, Windows, an RTX 3060 + RTX 5070 Ti split).  The same answer as the loop below gives.
     if (!ar_on() && *(volatile uint32_t*) h_seq_ < (uint32_t) (fl_k_ + 1)) {
         const double now = now_ms();
-        if (now - fl_flush_ms_ <= 2.0 && now - fl_since_ms_ <= 20000.0) return 0;
+        if (now - fl_flush_ms_ <= 2.0 && !fl_ring_.should_fire((int64_t) now)) return 0;
     }
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
@@ -3509,7 +3517,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
                 }
                 (void) cudaStreamQuery(cs_);
             }
-            if (now - fl_since_ms_ > 20000.0) {   // #267: no spin kernel may outlive the engine
+            if (fl_ring_.should_fire((int64_t) now)) {   // #267: no spin kernel may outlive the engine
                 trace_ev("TIMEOUT", fl_k_, l, 0);
                 err = "verify: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
                 return -1;
@@ -3546,6 +3554,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         ++fl_k_;
         ms_pool += ms_since(b);
         fl_since_ms_ = fl_flush_ms_ = now_ms();
+        fl_ring_.reset((int64_t) fl_since_ms_);
     }
     return 1;
 }
@@ -3557,7 +3566,7 @@ bool Verifier::done(std::string& err) {
     if (q == cudaErrorNotReady) {
         const double now = now_ms();
         if (now - fl_flush_ms_ > 2.0) { fl_flush_ms_ = now; (void) cudaStreamQuery(cs_); }
-        if (now - fl_since_ms_ > 20000.0) {   // every layer served, and the graph still runs: #267 as above
+        if (fl_ring_.should_fire((int64_t) now)) {   // every layer served, and the graph still runs: #267 as above
             err = "verify: the window never finished" + released_note(release_gpu_waits(5000));
         }
         return false;

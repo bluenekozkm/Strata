@@ -35,6 +35,7 @@
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
+#include "strata/core/ring_wait.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/gfx_arch.hpp"
@@ -1149,48 +1150,6 @@ MemSample mem_sample() {
 }
 
 // the stage the watchdog names: "<where> <detail>", and the prompt chunk a batched read is in (#251)
-// #1407: the file tier's activity as the OS counts it (Linux: major page faults and bytes read from storage). The #29
-// watchdog treats a growing count as "the step is slow, not stuck": a prompt layer whose experts are re-read from the
-// pack (low RAM, mmap experts) can take minutes while the heartbeat stands still. Zero where unavailable.
-static uint64_t file_tier_activity() {
-#if defined(__linux__)
-    uint64_t total = 0;
-    if (FILE* f = std::fopen("/proc/self/stat", "r")) {
-        char buf[1024] = {};
-        const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
-        std::fclose(f);
-        const char* p = std::strrchr(buf, ')');
-        if (p != nullptr && n > 0) {
-            // after "(comm)": state ppid pgrp session tty tpgid flags minflt cminflt majflt
-            unsigned long long majflt = 0;
-            if (std::sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %llu", &majflt) == 1) total += majflt;
-        }
-    }
-    if (FILE* f = std::fopen("/proc/self/io", "r")) {
-        char line[256];
-        while (std::fgets(line, sizeof(line), f) != nullptr) {
-            unsigned long long v = 0;
-            if (std::sscanf(line, "read_bytes: %llu", &v) == 1) total += v >> 20;   // MiB
-        }
-        std::fclose(f);
-    }
-    return total;
-#elif defined(_WIN32)
-    // #1984 #1971: Windows had no measure here, so a prompt waiting on mapped-file page-ins never got the I/O allowance.
-    // Bytes read (MiB) plus page faults / 8 (Windows counts soft faults too; a stuck engine makes almost none).
-    uint64_t total = 0;
-    IO_COUNTERS io{};
-    if (GetProcessIoCounters(GetCurrentProcess(), &io)) total += io.ReadTransferCount >> 20;
-    PROCESS_MEMORY_COUNTERS pmc{};
-    // >> 3, not >> 6: a host that pages hard reads from the pagefile at ~200 faults a second (#2049: 190/s, one
-    // thread waiting on one page at a time), which at >> 6 is 3 a second and never counted as busy
-    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) total += pmc.PageFaultCount >> 3;
-    return total;
-#else
-    return 0;
-#endif
-}
-
 std::string stage_text() {
     const strata::core::Progress& p = strata::core::progress();
     std::string s = std::string(p.where.load()) + " " + std::to_string((long long) p.detail.load());
@@ -9627,16 +9586,16 @@ int main(int argc, char** argv) {
                     uint64_t last = p.beats.load(), ticks_at = p.ticks.load();
                     auto since = std::chrono::steady_clock::now();
                     auto io_since = since;
-                    uint64_t io_last = file_tier_activity();
+                    uint64_t io_last = strata::core::file_tier_activity();
                     auto io_active_at = since;   // the last second the file tier was busy
                     bool io_noted = false;
                     for (;;) {
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                         const auto now = std::chrono::steady_clock::now();
                         const uint64_t b = p.beats.load();
-                        if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; io_since = now; io_active_at = now; io_noted = false; io_last = file_tier_activity(); continue; }
+                        if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; io_since = now; io_active_at = now; io_noted = false; io_last = strata::core::file_tier_activity(); continue; }
                         {   // sampled every second, also during the first `limit` seconds, so a busy file tier is seen
-                            const uint64_t a = file_tier_activity();
+                            const uint64_t a = strata::core::file_tier_activity();
                             if (a >= io_last + 16) io_active_at = now;   // 16 = faults + MiB read in a second: busy
                             io_last = a;
                         }
