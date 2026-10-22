@@ -43,5 +43,3 @@ upstream/main`; the push URL is set to `DISABLED`. Never push there, and never s
 merge base. After a merge, the removed paths (apps, Terminal, packaging, sycl, metal, setup, docker, the
 web UI, the Terminal/app docs, most of tools/, most of strata_control/) come back as modify/delete
 conflicts: resolve each with
-`git rm`, keep the whitelist above, then run the serve suite. The full keep/remove list is in the cleanup
-commit and in `.omc/ROADMAP.md`.
