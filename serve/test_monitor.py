@@ -187,16 +187,6 @@ class Monitor(unittest.TestCase):
         self.assertLess(records[1]["load_s"], records[0]["load_s"])
         self.assertTrue(all(r["state"] == "completed" for r in records))
 
-    def test_page_and_relative_assets_are_served(self):
-        code, html = self.request("/api-monitor")
-        self.assertEqual(code, 200)
-        self.assertIn('src="/web/monitor.js"', html)
-        code, script = self.request("/web/monitor.js")
-        self.assertEqual(code, 200)
-        self.assertIn("textContent", script)
-        self.assertNotIn("innerHTML", script)
-        self.assertEqual(self.request("/web/../server.py")[0], 404)
-
 
 class ConversationCacheCard(unittest.TestCase):
     """#596: /metrics' "conversation_cache": the parked conversations from the engine's log lines, the budget and
@@ -252,13 +242,6 @@ class ConversationCacheCard(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
-
-    def test_the_card_is_on_the_page(self):
-        web = Path(__file__).parent / "web"
-        html, js = (web / "index.html").read_text(encoding="utf-8"), (web / "app.js").read_text(encoding="utf-8")
-        for el in ("cc-card", "cc-slots-text", "cc-mem-text", "cc-facts", "cc-note"):
-            self.assertIn(f'id="{el}"', html)
-            self.assertIn(f'"{el}"', js)
 
 
 if __name__ == "__main__":

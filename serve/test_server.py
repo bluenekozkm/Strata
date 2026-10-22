@@ -3299,21 +3299,9 @@ class WebApp(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, e.headers.get("Content-Type", ""), e.read()
 
-    def test_page_and_files(self):
-        code, ctype, body = self.get("/")
-        self.assertEqual(code, 200)
-        self.assertIn("text/html", ctype)
-        self.assertIn(b"\"web/app.js\"", body)   # relative since #82 (works behind a path-prefixed proxy)
-        for path, want in (("/web/app.js", "javascript"), ("/web/app.css", "text/css"), ("/web/tokens.css", "text/css"),
-                           ("/web/components.css", "text/css"), ("/web/sprite.svg", "image/svg+xml")):
-            with self.subTest(path=path):
-                code, ctype, _ = self.get(path)
-                self.assertEqual(code, 200)
-                self.assertIn(want, ctype)
-
     def test_only_the_app_files_are_served(self):
         for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/fonts/..%2F..%2Fsetup.py",
-                     "/fonts/missing.woff2", "/fonts/x.ttf"):
+                     "/fonts/missing.woff2", "/fonts/x.ttf", "/"):
             with self.subTest(path=path):
                 self.assertEqual(self.get(path)[0], 404)
 
@@ -3529,7 +3517,6 @@ class WebApp(unittest.TestCase):
         try:
             self.assertEqual(self.get("/metrics")[0], 401)
             self.assertEqual(self.get("/metrics", {"Authorization": "Bearer secret"})[0], 200)
-            self.assertEqual(self.get("/")[0], 200)                  # the page itself asks for the key
         finally:
             self.svc.api_key = ""
 

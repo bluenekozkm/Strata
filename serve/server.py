@@ -658,9 +658,6 @@ def experts_loading_words(args: list, size: str) -> str:
     return f"loading the experts into RAM ({size}) and locking part of them for the GPU."
 
 
-OPENS_BROWSER = False        # set in main() when the server was started with --open: only then may a message say a browser opens
-
-
 def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0) -> None:
     """While the engine starts, say in the server window what it is doing, from its log: the start reads tens of GB
     into RAM and locks part of it for the GPU, and on many PCs everything is slow or frozen for a minute or more -
@@ -700,7 +697,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                     say("arena", f"[strata] {loading}\n"
                                  "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.\n"
                                  "         Please wait and don't close this window"
-                                 + ("; the browser opens when it is ready." if OPENS_BROWSER else "; the server says when it is ready."))
+                                 + "; the server says when it is ready.")
                 elif " loaded " in line and "GiB at" in line:
                     say("loaded", "[strata] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
                         f" ({time.time() - t0:.0f} s so far)")
@@ -2778,16 +2775,8 @@ def gpu_list(cfg: dict) -> list[int]:
 
 
 def engine_binary(exe: str, cfg: dict | None = None) -> str:
-    """The file that holds the engine's own option strings, for a feature check that reads it.  The Intel launcher
-    (sycl/serve/strata-sycl.sh) is a shell script that runs its repo's STRATA_SYCL_BIN (default build-sycl-aot/strata)
-    in a container, so the check reads that binary, not the script.  Any other `exe` is the engine itself."""
-    p = Path(exe)
-    if p.name == "strata-sycl.sh":
-        rel = ((cfg or {}).get("env") or {}).get("STRATA_SYCL_BIN") or os.environ.get("STRATA_SYCL_BIN") \
-            or "build-sycl-aot/strata"
-        b = p.resolve().parents[2] / rel
-        if b.is_file():
-            return str(b)
+    """The file that holds the engine's own option strings, for a feature check that reads it.  Any `exe` is
+    the engine itself."""
     return exe
 
 
@@ -5804,39 +5793,6 @@ def make_handler(svc: Service):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
-            if path.startswith("/fonts/"):
-                # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
-                name = path[len("/fonts/"):]
-                f = ROOT / "serve" / "web" / "fonts" / name
-                if "/" in name or "\\" in name or not name.endswith(".woff2") or not f.is_file():
-                    self._json(404, {"error": {"message": "not found"}})
-                    return
-                body = f.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "font/woff2")
-                self.send_header("Cache-Control", "max-age=86400")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            if path.startswith("/web/"):
-                # the web app's own files (serve/web): styles, script, icon sprite - same origin, no CDN
-                name = path[len("/web/"):]
-                types = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
-                         ".svg": "image/svg+xml"}
-                f = ROOT / "serve" / "web" / name
-                ext = os.path.splitext(name)[1]
-                if "/" in name or "\\" in name or ext not in types or not f.is_file():
-                    self._json(404, {"error": {"message": "not found"}})
-                    return
-                body = f.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", types[ext])
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
             if path == "/metrics/prometheus":
                 if self._authorized():
                     body = svc.prometheus().encode()
@@ -5863,7 +5819,7 @@ def make_handler(svc: Service):
                 return
             if path == "/v1/telemetry":
                 if self._authorized_telemetry():
-                    from strata_cli.client import normalize_legacy
+                    from serve.legacy_telemetry import normalize_legacy
                     snapshot = normalize_legacy(svc.metrics(), svc.v1_status())
                     snapshot["source"] = "server-v1"
                     snapshot["work"]["slots_requested"] = getattr(svc, "requested_slots", None)
@@ -6058,14 +6014,7 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
                 return
-            if path == "" or (path == "/api-monitor" and svc.api_monitor):
-                body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            elif path in ("/health", "/api/health"):
+            if path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
@@ -7564,7 +7513,6 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                                   "(\"0,2\"; also \"gpu\" in the config)")
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
                     help="pack tokenizer directory (falls back to a byte tokenizer if absent)")
-    ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
     ap.add_argument("--fit-max-tokens", action="store_true",
                     help="clamp max_tokens to the remaining context instead of rejecting the request "
                          "(the default; kept so older scripts keep working)")
@@ -7579,7 +7527,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                                          "the config)")
     ap.add_argument("--lazy", action="store_true", help="start the API unloaded (the engine and the vision encoder start with the first request)")
     ap.add_argument("--api-monitor", action="store_true",
-                    help="the API request monitor at /api-monitor: keeps the last 100 requests' prompts and answers in "
+                    help="the API request monitor: keeps the last 100 requests' prompts and answers in "
                          "memory (also \"api_monitor\": true in the config; off by default)")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help="unload the model after this many seconds without requests, so other programs (games, other "
@@ -7599,8 +7547,6 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                          "[{\"gpus\": [0, 1]}, {\"gpus\": [2, 3]}])")
     launch_args = list(sys.argv[1:] if argv is None else argv)
     a = ap.parse_args(launch_args)
-    global OPENS_BROWSER
-    OPENS_BROWSER = bool(a.open)
     # Every ordinary way of being asked to stop takes Ctrl+C's path (QUIT to the engine, then exit): SIGTERM (#96 docker
     # stop; systemd), SIGHUP (the terminal closed, ssh dropped), and on Windows Ctrl+Break and the console's close,
     # logoff and shutdown events. They are installed before anything slow starts, so one that arrives while the model
@@ -7789,7 +7735,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop()) if not groups else None
-        if note:                                        # #560 #516: before --open starts a browser on that card
+        if note:                                        # #560 #516: said before the model starts loading
             print(note, flush=True)
     else:
         effort_end = None
@@ -7880,7 +7826,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
               else f"[strata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)", flush=True)
     svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
     if svc.api_monitor:
-        print("[strata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
+        print("[strata] API request monitor on: the last 100 requests' prompts and answers are kept in "
               "memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),
               flush=True)
     if svc.cors_origins:
@@ -7997,12 +7943,6 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                   "in an admin PowerShell:\n         New-NetFirewallRule -DisplayName \"Strata " + str(bound_port) + "\" "
                   "-Direction Inbound -Protocol TCP -LocalPort " + str(bound_port) + " -Action Allow -Profile Private\n"
                   "       (and set this network to Private in Windows' network settings)", flush=True)
-    if a.open and cfg.get("open_browser") is not False:   # #609: the config's "open_browser": false wins (an older
-        import webbrowser                                  # run-<model>.bat still passes --open)
-        # on its own thread: webbrowser.open waits for the browser launcher, which on Linux can run for as long as
-        # the browser does, and the main thread must be free to take Ctrl+C and SIGTERM (#1872)
-        threading.Thread(target=webbrowser.open, daemon=True, name="strata-open-browser",
-                         args=(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{bound_port}/",)).start()
     if ready_path is not None or event_sink is not None:
         ready_host = f"[{here}]" if ":" in here and not here.startswith("[") else here
         record = {"schema_version": 1, "instance_id": svc.instance_id, "pid": os.getpid(),
