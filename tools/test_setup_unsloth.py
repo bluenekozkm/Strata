@@ -855,5 +855,17 @@ class BigFiles(Base):
             self.assertEqual(self.downloads, [])
 
 
+class GyroLowRam(Base):
+    """#3193: the Gyro low-RAM pack (the --experts-bin pass) takes the family's pack_args like its first pack."""
+
+    def test_the_low_ram_pack_gets_compat_bf16_like_the_first_pack(self):
+        code, out, _ = self.main(["--family", "gyro", "--low-ram", "on", "--context", "8192"],
+                                 m="Gyro-S", family=False, ram=31.9, version="0.1.45.1")
+        packs = [r for r in self.runs if any(x.endswith("iq_pack.py") for x in r)]
+        self.assertTrue(packs, (code, out[-1500:]))
+        self.assertTrue(all("--compat-bf16" in r for r in packs), packs)
+        self.assertTrue(any("--experts-bin" in r for r in packs), "the low-RAM pack ran")
+
+
 if __name__ == "__main__":
     unittest.main()
