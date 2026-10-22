@@ -88,4 +88,7 @@ node_modules/
 
 # local only
 /.zcode/
-/tools/
+/.opencode/
+/.agents/
+/local-tools/
+/.omc/

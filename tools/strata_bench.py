@@ -972,8 +972,10 @@ def main(argv=None) -> int:
     key = a.api_key or ((cfg or {}).get("api_key") or "")
     if a.url:
         base = a.url.rstrip("/")
+        port = None
     else:
-        base = server_base(cfg.get("host"), a.port or int(cfg.get("port", 8080)))
+        port = a.port or int(cfg.get("port", 8080))
+        base = server_base(cfg.get("host"), port)
     red = redactor(key=key)
     started = False
     try:
