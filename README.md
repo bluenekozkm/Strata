@@ -24,7 +24,8 @@ model and writes its run config.
   tokenizer's reference implementation) and the benchmark harness (`strata_bench.py`).
 - `prepare.py` — download a pinned model, build its tokenizer pack and MTP draft, write the run config,
   and compile the engine.
-- `bench/` — micro-benchmarks and measurement results.
+- `bench/` — micro-benchmarks and measurement results; **local only, not in the repository**
+  (`.gitignore`), so measurement data stays on this machine.
 
 ## Using it
 
@@ -64,7 +65,8 @@ git fetch upstream && git merge upstream/main
 The cleanup commit removed (among others): `apps/`, `strata_cli/`, `bin/`, `strata.py`, `setup.py`,
 `setup.sh`, `packaging/`, `sycl/`, `metal/`, `serve/web/`, `docker/`, `integrations/`, `.github/` bots,
 `tests/{terminal,tuning,time_skip,desktop,sycl}`, the NVFP4 model sizes from the catalog, the Terminal and
-app docs, and most of `tools/` (the keep-list is in that commit). After a merge, resolve each
+app docs, and most of `tools/` (the keep-list is in that commit); `bench/` is untracked (local only). After
+a merge, resolve each
 modify/delete conflict on those paths with `git rm`, then run the serve suite:
 
 ```sh

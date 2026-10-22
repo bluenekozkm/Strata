@@ -30,8 +30,9 @@ model sizes are not in this slim catalog.
 - The engine's own tests: `cmake -B build-test -DSTRATA_BUILD_TESTS=ON && cmake --build build-test`.
 - Build every backend a file touches before asking for review of an engine change (HIP is the one verified
   on this machine; CUDA compiles on any machine with nvcc).
-- Model tools live in `tools/` (tokenizer, packs, MTP, NVFP4); benchmarks with `tools/strata_bench.py`
-  and `bench/`. Keep measured claims with what they were measured on; make no claim without a measurement.
+- Model tools live in `tools/` (tokenizer, packs, MTP, NVFP4); benchmarks run with `tools/strata_bench.py`.
+  `bench/` (micro-benchmarks and results) is local only — it is in `.gitignore`, never commit it. Keep
+  measured claims with what they were measured on; make no claim without a measurement.
 - Keep the docs' style: plain words, short sentences. The docs kept are DETAILS.md, the paper, AMD_HIP,
   MULTI_GPU and NVFP4; anything else upstream writes stays unmerged (see below).
 
