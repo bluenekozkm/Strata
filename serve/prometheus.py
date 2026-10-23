@@ -145,6 +145,11 @@ def strata(m: dict, out: list, lab: str):
            last.get("hit_rate"))
     metric("last_decode_tok_s", "gauge", "The last request's decode rate (requests[0].decode_tok_s).",
            last.get("decode_tok_s"))
+    metric("last_prefill_tok_s", "gauge", "The last request's prompt-reading rate (requests[0].prefill_tok_s).",
+           last.get("prefill_tok_s"))
+    metric("last_warm_hit_rate", "gauge",
+           "The share of the last request's file-tier reads the page cache held whole (requests[0].warm_hit_rate).",
+           last.get("warm_hit_rate"))
     gpus = hw.get("gpus") or ([{"index": 0, "util": hw.get("gpu_util"), "mem_used": hw.get("gpu_mem_used"),
                                 "mem_total": hw.get("gpu_mem_total"), "temp": hw.get("gpu_temp"),
                                 "power": hw.get("gpu_power")}] if hw.get("gpu_util") is not None else [])

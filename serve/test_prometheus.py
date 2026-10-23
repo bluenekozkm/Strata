@@ -80,7 +80,7 @@ class Units(unittest.TestCase):
         m = {"engine": {"model": "m", "max_context": 1000},
              "live": {"state": "reading", "queued": 0, "prompt_read": 300, "prefill_tok_s_mean": 2500.0},
              "totals": {"requests": 1, "prompt_ms": 1500.0, "decode_ms": 2000.0},
-             "requests": [{"hit_rate": 0.97, "decode_tok_s": 101.5}],
+             "requests": [{"hit_rate": 0.97, "decode_tok_s": 101.5, "prefill_tok_s": 2500.0, "warm_hit_rate": 0.8}],
              "hardware": {"gpu_util": 40.0, "gpus": [{"index": 0, "util": 30.0, "mem_used": 1 << 30, "temp": 60},
                                                      {"index": 1, "util": 50.0, "mem_used": 2 << 30, "temp": 65}],
                           "cpu": 12.5, "ram_used": 8 << 30, "ram_total": 64 << 30}}
@@ -91,10 +91,25 @@ class Units(unittest.TestCase):
         self.assertEqual(got[("strata:live_prompt_read", lab)], 300)
         self.assertEqual(got[("strata:totals_decode_seconds_total", lab)], 2.0)
         self.assertEqual(got[("strata:last_hit_rate", lab)], 0.97)
+        self.assertEqual(got[("strata:last_decode_tok_s", lab)], 101.5)
+        self.assertEqual(got[("strata:last_prefill_tok_s", lab)], 2500.0)
+        self.assertEqual(got[("strata:last_warm_hit_rate", lab)], 0.8)
         self.assertEqual(got[("strata:gpu_util", lab + ',gpu="1"')], 50)
         self.assertEqual(got[("strata:gpu_mem_used_bytes", lab + ',gpu="0"')], 1 << 30)
         self.assertNotIn(("strata:gpu_power_watts", lab + ',gpu="0"'), got)   # not measured: no sample
         self.assertEqual(got[("strata:ram_total_bytes", lab)], 64 << 30)
+
+    def test_strata_last_rates_without_a_counting_engine(self):
+        """An engine that says no prefill rate and counts no page cache leaves the two gauges without samples."""
+        m = {"engine": {"model": "m", "max_context": 1000},
+             "live": {"state": "idle"},
+             "totals": {},
+             "requests": [{"hit_rate": 0.97, "decode_tok_s": 101.5}]}
+        got = parse(render(m, Latencies().snapshot()))
+        lab = 'model_name="m"'
+        self.assertIn(("strata:last_hit_rate", lab), got)
+        self.assertNotIn(("strata:last_prefill_tok_s", lab), got)
+        self.assertNotIn(("strata:last_warm_hit_rate", lab), got)
 
 
 class Endpoint(unittest.TestCase):

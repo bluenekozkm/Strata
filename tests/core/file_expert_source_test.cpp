@@ -1102,6 +1102,7 @@ int main(int argc, char** argv) {
         test_unbuffered_reads();
         test_io_prefetch();
         test_warm_advice();
+        test_budget_lend_first();   // a small cache and a tiny fixture: run by default, not only under --rotation-gpu
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
 #endif
@@ -1113,7 +1114,6 @@ int main(int argc, char** argv) {
             test_foresight_exchange(true);
             test_replace_resident(true);
             test_replace_resident(false);
-            test_budget_lend_first();
         }
         std::cout << "file_expert_source_test: PASS\n";
         return 0;

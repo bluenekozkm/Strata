@@ -1322,10 +1322,16 @@ class StrataEngine:
         if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
             self.last.update(offloaded=int(f[15]))
         for tok in f[16:]:                                # key=value fields after the positional ones (the prompt's
-            key, eq, value = tok.partition("=")           # first chunk and its streamed expert blobs)
+            key, eq, value = tok.partition("=")           # first chunk, its streamed expert blobs, the warm cache)
             if eq and key in ("chunk", "experts_streamed"):
                 try:
                     self.last[key] = int(value)
+                except ValueError:
+                    pass
+            elif eq and key == "warm" and value.count("/") == 1:   # the file-tier reads the page cache held whole
+                try:                                       # (the warm set's hit rate; absent: not counted)
+                    hits, reads = value.split("/")
+                    self.last.update(warm_hits=int(hits), warm_blobs=int(reads))
                 except ValueError:
                     pass
 
@@ -1752,6 +1758,7 @@ class StrataEngine:
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress, self.progress_ms, self.reused = None, 0, 0
+        self.prefill_tok_s_mean = None   # the last request's PP rate must not read as this one's before its first PP
         born = self.gen                                 # the engine process this request is sent to
         keys = self.sampling_keys(sampling or {})
         out: list[int] = []
@@ -2473,6 +2480,7 @@ class StrataEngine:
                 self.ended = True
                 self.progress, self.last = None, {}
                 self.progress_ms, self.reused = 0, 0
+                self.prefill_tok_s_mean = None
 
 
 IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app attaches pictures of up to 20 MB)
@@ -4845,7 +4853,9 @@ class Service:
         if s.get("first_token") is None:
             pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
             done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
-            print(f"[strata] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
+            pps = getattr(self.engine, "prefill_tok_s_mean", None)   # PP's fresh tokens/s over the read so far
+            rate = f", {pps:.1f} tok/s" if pps else ""   # None until the first PP line lands: nothing read to rate
+            print(f"[strata] reading the prompt: {done} tokens{rate}, {el:.0f} s so far", flush=True)
         else:
             rate = s["generated"] / max(RATE_MIN_SPAN_S, now - s["first_token"])
             # #984: while a thinking budget applies, the thinking line shows it, not the request's max_tokens
@@ -5286,6 +5296,10 @@ class Service:
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
                             seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
+                            # the prompt-reading rate from the engine's own clock, and the warm set's share of the
+                            # file-tier reads the page cache held whole (None: the engine does not count the cache)
+                            prefill = (request_timings(seen, n, last) or {}).get("prompt_per_second")
+                            warm_rate = round(last["warm_hits"] / last["warm_blobs"], 3) if last.get("warm_blobs") else None
                             self.history.append({
                                 "id": request_id,
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
@@ -5301,7 +5315,9 @@ class Service:
                                 "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                                 if n and last.get("generated") and last.get("decode_ms") else None,
-                                "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
+                                "prefill_tok_s": prefill,
+                                "hit_rate": hit_rate, "pcie_share": pcie_share, "warm_hit_rate": warm_rate,
+                                "ram_blobs": last.get("ram_blobs"),
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
@@ -5330,9 +5346,12 @@ class Service:
                             hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                             if hit_msg and pcie_share:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
+                            warm_msg = f", warm page cache {warm_rate*100:.1f}% hit" if warm_rate is not None else ""
                             rate_txt = f"{rate:.1f} tok/s" if rate is not None else "no speed"
+                            if prefill is not None:
+                                rate_txt += f", prefill {prefill:.1f} tok/s"
                             print(f"[strata] done: {n} tokens in {el:.0f} s ({rate_txt}) "
-                                  f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+                                  f"({finish}, cancel={cancel.is_set()}){hit_msg}{warm_msg}", flush=True)
                             if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
                                 print("[strata] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
@@ -5474,7 +5493,8 @@ def request_stats(segments: list[dict]) -> dict:
         else:
             result.pop(key, None)
     for key in ("prompt_ms", "decode_ms", "generated", "drafts_offered", "drafts_accepted",
-                "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb", "experts_streamed"):
+                "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb", "experts_streamed",
+                "warm_hits", "warm_blobs"):
         if any(segment.get(key) is not None for segment in segments):
             result[key] = sum(segment.get(key) or 0 for segment in segments)
     return result

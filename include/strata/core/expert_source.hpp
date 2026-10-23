@@ -965,6 +965,7 @@ public:
     bool io_stats() const { return io_stats_; }
     struct IoCounters {
         uint64_t cached_bytes = 0, uncached_bytes = 0;       ///< file reads at hand-out, by page-cache residency
+        uint64_t blobs = 0, warm_blobs = 0;                  ///< file-tier blob reads, and how many the page cache held in full
         uint64_t pread_bytes = 0, pread_us = 0, pread_n = 0; ///< bytes read with pread, thread time, calls
         uint64_t pf_demand = 0;                              ///< blobs the layer asked for that the workers were handed
         uint64_t pf_jobs = 0, pf_read_blobs = 0, pf_resident_skips = 0, pf_dropped = 0;   ///< prefetch workers
@@ -1173,6 +1174,7 @@ private:
     std::vector<char> stage_pf_;                      ///< per stage buffer: filled ahead, not yet used by a layer
     std::vector<int> io_fds_;                         ///< per mapped file: a plain descriptor (POSIX_FADV_RANDOM) for the preads
     mutable std::atomic<uint64_t> io_cached_{0}, io_uncached_{0}, io_pread_bytes_{0}, io_pread_us_{0}, io_pread_n_{0};
+    mutable std::atomic<uint64_t> io_blobs_{0}, io_warm_blobs_{0};   ///< file-tier reads counted, all-cached of them
     std::atomic<uint64_t> io_pf_jobs_{0}, io_pf_demand_{0}, io_pf_blobs_{0}, io_pf_skips_{0}, io_pf_dropped_{0}, io_pf_used_{0}, io_pf_unused_{0},
         io_crit_us_{0}, io_crit_n_{0};
     struct Span { const uint8_t* p; uint64_t n; int fd; uint64_t off; uint64_t at; };

@@ -2397,6 +2397,28 @@ class PcieShare(unittest.TestCase):
         self.assertIn("expert cache 60.0% hit (+20.0% of the routed experts over PCIe)", out.getvalue())
 
 
+class WarmCacheAndPrefill(unittest.TestCase):
+    """The done line names the prompt-reading rate (the engine's own clock) and, when the engine counts the page
+    cache (io prefetch, STRATA_IO_STATS=1, the warm set), the share of the file-tier reads it held whole.  An engine
+    that sends neither keeps both out of the line and the history."""
+
+    def test_done_line(self):
+        tok = ByteTokenizer()
+        engine = DoneLineEngine(tok, "</think>\n\nok", max_context=CTX, done_lines=[
+            "DONE 4 20 40.0 30.0 stop 3 5 0 60 100 0 0 0.0 20 0 chunk=512 warm=8/10",
+            "DONE 4 20 40.0 30.0 stop 3 5 0 60 100 0 0 0.0 20 0"])       # the page cache not counted
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            for _ in range(2):
+                list(svc.run(tok.encode("hi"), False, None, 10, {}, threading.Event()))
+        rows = list(svc.history)
+        self.assertEqual([r["prefill_tok_s"] for r in rows], [50.0, 50.0])   # 2 tokens in 40.0 ms
+        self.assertEqual([r["warm_hit_rate"] for r in rows], [0.8, None])
+        self.assertEqual([r["hit_rate"] for r in rows], [0.6, 0.6])
+        self.assertIn("(133.3 tok/s, prefill 50.0 tok/s)", out.getvalue())
+        self.assertEqual(out.getvalue().count("warm page cache 80.0% hit"), 1)
+
+
 class PeerDevice(unittest.TestCase):
     """#665: several GPUs in the config are a layer split, but --peer-device uses the second card as an expert-cache
     tier, and the engine refuses it beside --layer-split: the server must not add one then."""
@@ -2911,12 +2933,33 @@ class CancelledRead(unittest.TestCase):
         self.assertNotIn("chunk", e.last)
         self.assertNotIn("other", e.last)
 
+    def test_parse_done_warm_field(self):
+        """The warm set's page-cache hits come as `warm=<hits>/<reads>` after the positional fields; a line without it
+        (an older engine, or the page cache is not counted) leaves both out, a malformed one is dropped."""
+        e = SimpleNamespace()
+        StrataEngine._parse_done(e, "DONE 5 12000 900.0 80.0 stop 3 4 0 7 9 0 0 0.0 12000 0 chunk=1536 warm=88/100")
+        self.assertEqual((e.last["warm_hits"], e.last["warm_blobs"]), (88, 100))
+        StrataEngine._parse_done(e, "DONE 5 12000 900.0 80.0 stop 3 4 0 7 9 0 0 0.0 12000 0 warm=0/0")
+        self.assertEqual((e.last["warm_hits"], e.last["warm_blobs"]), (0, 0))
+        StrataEngine._parse_done(e, "DONE 5 12000 900.0 80.0 stop 3 4 0 7 9 0 0 0.0 12000 0")
+        self.assertNotIn("warm_hits", e.last)
+        self.assertNotIn("warm_blobs", e.last)
+        StrataEngine._parse_done(e, "DONE 5 12000 900.0 80.0 stop 3 4 0 7 9 0 0 0.0 12000 0 warm=8/")
+        self.assertNotIn("warm_hits", e.last)
+
     def test_request_stats_chunk_fields(self):
         """Across a request's continuations the streamed blobs add up; the chunk is the request's own read's."""
         stats = request_stats([{"prompt_ms": 10.0, "chunk": 1536, "experts_streamed": 100},
                                {"prompt_ms": 2.0, "chunk": 64, "experts_streamed": 5}])
         self.assertEqual((stats["chunk"], stats["experts_streamed"], stats["prompt_ms"]), (1536, 105, 12.0))
         self.assertNotIn("chunk", request_stats([{"prompt_ms": 1.0}, {"prompt_ms": 1.0, "chunk": 64}]))
+
+    def test_request_stats_warm_fields(self):
+        """The warm page-cache hits and reads total across a request's legs, like the hit rate's lookups."""
+        stats = request_stats([{"prompt_ms": 10.0, "warm_hits": 30, "warm_blobs": 40},
+                               {"prompt_ms": 2.0, "warm_hits": 8, "warm_blobs": 10}])
+        self.assertEqual((stats["warm_hits"], stats["warm_blobs"]), (38, 50))
+        self.assertNotIn("warm_hits", request_stats([{"prompt_ms": 1.0}, {"prompt_ms": 1.0}]))
 
     def test_prompt_tokens_seen(self):
         last = {"finish": "cancel", "reused": 1000, "prompt_read": 2000}
@@ -4308,6 +4351,27 @@ class ThinkingBudget(unittest.TestCase):
         self.assertIn("thinking: 10 of budget 2048 (max 6400) tokens", lines[0])
         self.assertIn("answering: 10 of max 6400 tokens", lines[1])
         self.assertIn("thinking: 10 of max 6400 tokens", lines[2])
+
+    def test_the_reading_progress_line_shows_the_prompt_rate(self):
+        """The PP line's fresh tokens/s reads in the window while the prompt is read; until the first chunk lands there
+        is nothing read to rate, so the line keeps to position and seconds."""
+        st = {"phase": "reading the prompt", "generated": 0, "first_token": None, "started": time.time() - 2,
+              "prompt_tokens": 63}
+        self.engine.progress = (58, 63)
+        self.engine.prefill_tok_s_mean = 1234.5
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.svc._progress(0, st=st)
+            self.engine.progress = None                       # no PP yet
+            self.engine.prefill_tok_s_mean = None
+            self.svc._progress(0, st=st)
+            self.engine.progress = (58, 63)                   # a PP line with the rate field missing (an older engine)
+            self.svc._progress(0, st=st)
+        lines = out.getvalue().splitlines()
+        self.assertIn("reading the prompt: 58 of 63 tokens, 1234.5 tok/s, 2 s so far", lines[0])
+        self.assertIn("reading the prompt: 63 tokens, 2 s so far", lines[1])
+        self.assertIn("reading the prompt: 58 of 63 tokens, 2 s so far", lines[2])
+        self.assertNotIn("tok/s", lines[2])
 
     def test_a_budget_above_max_tokens_is_capped_to_leave_room_for_the_answer(self):
         """#984: max_tokens 300 and a budget of 5000 never fired: the reply ended while still thinking.  The thinking

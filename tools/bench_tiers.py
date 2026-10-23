@@ -5,8 +5,9 @@
 
 An arm is the installed config plus one mechanism under test (extra engine args, extra env).  Every arm gets its own
 config copy under bench/arms/ (so its own engine log), runs tools/strata_bench.py against it on a bench port, and then
-the full engine log is parsed for the tier lines (expert tiers, file tier I/O, decode hit rate) into the result
-folder's tiers.json and a tiers.md summary.  `summary` prints every arm measured so far side by side.
+the full engine log is parsed for the tier lines (expert tiers, file tier I/O, the file tier's warm reads, decode hit
+rate) into the result folder's tiers.json and a tiers.md summary.  `summary` prints every arm measured so far side by
+side.
 
     python3 tools/bench_tiers.py summary
 
@@ -81,8 +82,8 @@ def make_arm_config(base: dict, name: str) -> Path:
     return path
 
 
-def run_arm(name: str, runs: int, port: int) -> Path:
-    base = json.loads((ROOT / "strata-gyro-gyro-m.json").read_text(encoding="utf-8-sig"))
+def run_arm(name: str, runs: int, port: int, config: str) -> Path:
+    base = json.loads((ROOT / config).read_text(encoding="utf-8-sig"))
     cfg_path = make_arm_config(base, name)
     log_path = ARMS_DIR / f"{name}.log"
     if log_path.exists():
@@ -119,6 +120,7 @@ RE = {
     "prefill_plan": re.compile(r"prefill plan inputs: ([^;]+); ([\d.]+) GiB available for the page cache"),
     "tiers": re.compile(r"expert tiers: GPU (\d+) hits this request; since the start RAM (\d+) blobs, files (\d+) blobs ([\d.]+) MB read"),
     "io": re.compile(r"file tier I/O this request: the OS read ([\d.]+) MB from storage \((\d+) major faults\) for ([\d.]+) MB of expert reads"),
+    "warm": re.compile(r"file tier reads this request: (\d+) warm in the page cache of (\d+) \(([\d.]+)%\), (\d+) cold from storage"),
     "cache_held": re.compile(r"page cache held ([\d.]+) MB at the read, not ([\d.]+) MB"),
     "crit": re.compile(r"decode waited ([\d.]+) ms in (\d+) fetches"),
     "hit": re.compile(r"decode expert cache hit rate: ([\d.]+)% \((\d+) hits / (\d+) lookups\)"),
@@ -147,6 +149,12 @@ def parse_arm_log(path: Path) -> dict:
             if hit := RE["cache_held"].search(line):
                 req["cache_held_mb"] = float(hit.group(1))
                 continue
+            if hit := RE["warm"].search(line):
+                req["warm_blobs"] = int(hit.group(1))
+                req["file_blobs"] = int(hit.group(2))
+                req["warm_pct"] = float(hit.group(3))
+                req["cold_blobs"] = int(hit.group(4))
+                continue
             if hit := RE["crit"].search(line):
                 req["crit_ms"] = float(hit.group(1))
                 req["crit_fetches"] = int(hit.group(2))
@@ -174,6 +182,8 @@ def tier_summary(mt: dict) -> dict:
         "expert_read_gb_total": round(expert / 1e3, 2),
         "amplification": round(storage / expert, 2) if expert > 1 else None,
         "hit_pct_median_tail": med([r["hit_pct"] for r in tail if "hit_pct" in r]),
+        "warm_pct_median_tail": med([r["warm_pct"] for r in tail if "warm_pct" in r]),
+        "cold_reads_total": sum(r.get("cold_blobs", 0) for r in reqs),
         "crit_ms_median_tail": med([r["crit_ms"] for r in tail if "crit_ms" in r]),
         "crit_ms_total": round(sum(r.get("crit_ms", 0.0) for r in reqs), 1),
         "ram_adapt_moved_total": sum(r.get("ram_adapt_moved", 0) for r in reqs),
@@ -193,10 +203,11 @@ def render_tiers_md(mt: dict) -> str:
         L.append(f"| {k} | {v} |")
     L += ["", "Startup lines:", ""] + [f"- `{s['line']}`" for s in mt.get("startup", [])[:12]]
     L += ["", "Per-request tail (the last 6):", "",
-          "| gpu hits | hit % | storage MB | expert MB | amplification | decode waited ms |", "| --- | --- | --- | --- | --- | --- |"]
+          "| gpu hits | hit % | warm % | file blobs | cold | storage MB | expert MB | amplification | decode waited ms |",
+          "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for r in mt.get("requests", [])[-6:]:
-        L.append(f"| {r.get('gpu_hits')} | {r.get('hit_pct')} | {r.get('storage_mb')} | {r.get('expert_mb')} | "
-                 f"{r.get('amplification')} | {r.get('crit_ms')} |")
+        L.append(f"| {r.get('gpu_hits')} | {r.get('hit_pct')} | {r.get('warm_pct')} | {r.get('file_blobs')} | {r.get('cold_blobs')} | "
+                 f"{r.get('storage_mb')} | {r.get('expert_mb')} | {r.get('amplification')} | {r.get('crit_ms')} |")
     return "\n".join(L) + "\n"
 
 
@@ -225,11 +236,12 @@ def summary() -> None:
         rows.append((mt, tier_summary(mt), med_speed))
     if not rows:
         sys.exit("no tiers.json under bench/results yet")
-    L = ["| arm | chat dec | 4K prompt | 16K prompt | agent dec | hit % | amplification | storage GB | crit ms (tail) | lend covered |",
-         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    L = ["| arm | chat dec | 4K prompt | 16K prompt | agent dec | hit % | warm % | cold reads | amplification | storage GB | crit ms (tail) | lend covered |",
+         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for mt, s, sp in rows:
         L.append(f"| {mt['arm']} | {sp.get('chat_decode')} | {sp.get('4k_prompt')} | {sp.get('16k_prompt')} | "
-                 f"{sp.get('agent_decode')} | {s['hit_pct_median_tail']} | {s['amplification']} | "
+                 f"{sp.get('agent_decode')} | {s['hit_pct_median_tail']} | {s['warm_pct_median_tail']} | "
+                 f"{s['cold_reads_total']} | {s['amplification']} | "
                  f"{s['storage_gb_total']} | {s['crit_ms_median_tail']} | {s['lend_covered']} |")
     out = RESULTS_DIR / "tiers-summary.md"
     out.write_text("\n".join(L) + "\n", encoding="utf-8")
@@ -240,6 +252,8 @@ def summary() -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--arm", action="append", choices=sorted(ARMS), help="an arm to measure (repeatable, run in order)")
+    ap.add_argument("--config", default="strata-gyro-gyro-m.json",
+                    help="the installed config the arms copy, relative to the repo (default strata-gyro-gyro-m.json)")
     ap.add_argument("--runs", type=int, default=3, help="strata_bench runs per test (default 3)")
     ap.add_argument("--port", type=int, default=BENCH_PORT, help="the port the arm's server starts on")
     ap.add_argument("cmd", nargs="?", choices=["summary"], help="print the arms measured so far side by side")
@@ -248,7 +262,7 @@ def main() -> None:
         summary()
     elif a.arm:
         for name in a.arm:
-            run_arm(name, a.runs, a.port)
+            run_arm(name, a.runs, a.port, a.config)
         summary()
     else:
         ap.error("give --arm (repeatable) or summary")

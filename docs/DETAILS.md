@@ -351,12 +351,19 @@ session decodes 18.9 -> 19.7 tok/s; the short chat's decode gives back what the 
 hottest up to N GiB (capped by the RAM left less a 2 GiB floor) are asked for with `MADV_WILLNEED`, and advised pairs
 whose routing fell under `STRATA_WARM_FLOOR` (0.5) are handed back with `MADV_DONTNEED` plus
 `POSIX_FADV_DONTNEED` (the Linux files tier; a no-op elsewhere). The page cache then holds the warm set instead of the
-dead tail of an old prompt. Same box as above, against the plain mapped mode: the fresh 16K prompt 383 -> 549 tok/s,
-the agent session 18.7 -> 20.7 tok/s, the suite's storage reads 711 -> 637 GB (0.55 -> 0.51 of the expert reads), the
-short chat 23.2 -> 26.4 tok/s. A larger set was worse here (8 GiB: 16K 477, agent 19.5) - it starts evicting its own
-tail. Beside `--resident-budget-gib` the budget's headroom grows by the set plus 2 GiB, so the copy cannot starve the
+dead tail of an old prompt. Same box as above, against the plain mapped mode (2026-10-23; the suite's arms run one
+after another and share the page cache): the suite's storage reads fell 463 -> 403 GB and the read amplification
+0.37 -> 0.31 of the expert reads; the short chat 26.9 -> 28.3 tok/s and the agent session 22.4 -> 22.0 tok/s sat
+inside run-to-run noise, and the fresh 16K prompt swung too much between the arms to compare. The 8 GiB set read
+429 GB, more than the 6 GiB one. (The numbers this paragraph had before 2026-10-23 came from runs where the advice
+never ran - a sizing bug left the set empty - so they measured the arm order, not the set.) Beside
+`--resident-budget-gib` the budget's headroom grows by the set plus 2 GiB, so the copy cannot starve the
 set: at budget 15 without it, 3.5 GiB of page cache were left for a 9.1 GiB file tier and the OS read 33 GB from
-storage for 7.7 GB of expert reads.
+storage for 7.7 GB of expert reads. The set comes with the page-cache counts (`STRATA_IO_STATS=1` turns the same
+counts on without it), so each request's log names its hit rate: `file tier reads this request: N warm in the page
+cache of M (P%), K cold from storage`. The DONE line carries the same numbers as `warm=<hits>/<reads>`, and the
+server's done line adds the warm percentage and the prompt-reading rate (`prefill N tok/s`, from the engine's clock)
+beside the expert cache's hit rate.
 
 **Opt-in switches measured on a hybrid Intel CPU under Windows (Core i7-13700K, 8 P + 8 E cores, RTX 5090, 64 GB RAM,
 Windows 11, Swift 1.5 IQ3_XXS at 128K):**

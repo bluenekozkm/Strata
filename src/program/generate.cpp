@@ -544,6 +544,9 @@ struct Options {
     /// not hold that the expert profile ranks hottest are copied into RAM, the rest are read from the files in place
     /// (the GGUF shards when the pack has no experts.bin).  0 = the whole complement (--resident-experts).
     uint64_t resident_budget = 0;
+    /// M5: the managed warm set's size in bytes (STRATA_WARM_SET_GIB), parsed once with the options: the
+    /// --resident-budget-gib headroom raise and the serve loop's warm set must see the same number.
+    uint64_t warm_set_bytes = 0;
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
     /// consumer yet - `moe_hit_grouped_s2` does not exist - so switching it on costs the fill traffic and
@@ -2709,13 +2712,14 @@ int main(int argc, char** argv) {
             // M5: a managed warm set (STRATA_WARM_SET_GIB) lives in the page cache beside the copy - the budget's
             // clamp and safety check must leave its room, or the copy starves the set and the cold tier falls back
             // to the drive (measured 4.3x read amplification on a 32 GB PC at budget 15 with 3.5 GiB of cache left)
-            if (const char* v = std::getenv("STRATA_WARM_SET_GIB"); v != nullptr && std::atof(v) > 0.0) {
-                const uint64_t warm = (uint64_t) (std::atof(v) * 1073741824.0) + (2ull << 30);   // + 2 GiB floor
+            if (o.warm_set_bytes > 0) {
+                const uint64_t warm = o.warm_set_bytes + (2ull << 30);   // + 2 GiB floor
                 if (warm > o.resident_headroom) {
                     o.resident_headroom = warm;
                     std::fprintf(stderr, "strata generate: headroom raised to %.2f GiB: the %.2f GiB warm set and a "
                                          "2 GiB floor live beside the budget (STRATA_WARM_SET_GIB)\n",
-                                 (double) o.resident_headroom / 1073741824.0, std::atof(v));
+                                 (double) o.resident_headroom / 1073741824.0,
+                                 (double) o.warm_set_bytes / 1073741824.0);
                 }
             }
         }
@@ -2736,6 +2740,12 @@ int main(int argc, char** argv) {
             return 2;
         }
         }
+    }
+    // M5: the managed warm set's size, parsed once here so the --resident-budget-gib headroom raise above and the
+    // serve loop's warm set cannot drift apart
+    if (const char* v = std::getenv("STRATA_WARM_SET_GIB"); v != nullptr && v[0] != '\0') {
+        const double gib = std::atof(v);
+        o.warm_set_bytes = gib > 0.0 ? (uint64_t) (gib * 1073741824.0) : 0ull;
     }
 #if defined(STRATA_USE_HIP)
     {   // gfx1151 (Strix Halo): the switches that are exact there are on by default (strata/core/arch_defaults.hpp); before
@@ -5676,6 +5686,10 @@ int main(int argc, char** argv) {
                     (void) cudaGetLastError();
 #endif
             }
+        } else if (o.warm_set_bytes > 0) {
+            // the warm set lives in the page cache: its hit rate is the mincore counts, so they come with it
+            // (a few us per blob); STRATA_IO_STATS=1 turns them on without it
+            src.set_io_stats(true);
         } else if (const char* sv = std::getenv("STRATA_IO_STATS"); sv != nullptr && std::atoi(sv) != 0) {
             src.set_io_stats(true);
         }
@@ -10131,12 +10145,7 @@ int main(int argc, char** argv) {
         // box the page cache then holds the warm set, not the dead tail of an old prompt.  Linux mapped files only;
         // pairs the VRAM cache or the RAM copy holds are skipped (they are warmer than warm).  The async adaptive
         // tier (--adapt-async) has its own chooser and does not run this.
-        const uint64_t warm_set_bytes = [] {
-            const char* v = std::getenv("STRATA_WARM_SET_GIB");
-            if (v == nullptr || v[0] == '\0') return 0ull;
-            const double gib = std::atof(v);
-            return gib > 0.0 ? (uint64_t) (gib * 1073741824.0) : 0ull;
-        }();
+        const uint64_t warm_set_bytes = o.warm_set_bytes;   // parsed once with the options (the headroom raise uses it)
         const int64_t warm_every = [] {
             const char* v = std::getenv("STRATA_WARM_EVERY");
             const int64_t n = v != nullptr && v[0] != '\0' ? std::atoll(v) : 8;
@@ -10147,7 +10156,8 @@ int main(int argc, char** argv) {
             const float f = v != nullptr && v[0] != '\0' ? (float) std::atof(v) : 0.5f;
             return f > 0.0f ? f : 0.5f;
         }();
-        std::vector<uint8_t> warm_mark;   // the pairs the warm set advised: chill candidates when they go cold
+        std::vector<uint8_t> warm_mark(   // the pairs the warm set advised: chill candidates when they go cold
+            warm_set_bytes > 0 ? (size_t) g.n_layers * (size_t) g.n_expert : (size_t) 0, 0);
         int64_t warm_rounds = 0, warm_advised = 0, warm_chilled = 0;
         if (warm_set_bytes > 0)
             std::fprintf(stderr, "strata serve: the managed warm set: up to %.2f GiB of the file tier kept in the page "
@@ -10156,7 +10166,8 @@ int main(int argc, char** argv) {
                          (double) warm_set_bytes / 1073741824.0, (long long) warm_every, (double) warm_floor);
         auto maintain_warm = [&]() {
             if (warm_mark.empty() || srcp != &src) return;
-            if (warm_rounds++ % warm_every != 0) return;
+            const int64_t round = warm_rounds++;   // this run's round (0-based): the report and the full re-advise test
+            if (round % warm_every != 0) return;   // it, and they divide it, so the post-incremented counter never could
             // the set's size: the env's bytes against the RAM left beside the engine (2 GiB for everything else)
             uint64_t budget = warm_set_bytes;
             strata::core::detail::HostMemory hm;
@@ -10167,7 +10178,7 @@ int main(int argc, char** argv) {
             std::vector<uint8_t> next(warm_mark.size(), 0);
             uint64_t at = 0;
             int64_t advised = 0;
-            const bool reall = warm_rounds % (warm_every * 4) == 0;   // re-advise the whole set once in a while
+            const bool reall = round % (warm_every * 4) == 0;   // re-advise the whole set once in a while
             std::vector<std::pair<float, int64_t>> cand;   // (decayed routing, pair index), hottest first
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
@@ -10209,7 +10220,7 @@ int main(int argc, char** argv) {
             warm_advised += advised;
             warm_chilled += chilled;
             warm_mark.swap(next);
-            if (warm_rounds % (warm_every * 8) == 0) {   // the throttled report, with a tier sample of the set
+            if (round % (warm_every * 8) == 0 && round > 0) {   // the throttled report, with a tier sample of the set
                 int seen = 0, cached = 0;
                 for (int64_t i = 0; i < (int64_t) warm_mark.size() && seen < 128; ++i) {
                     if (!warm_mark[(size_t) i] || (i % 97) != warm_rounds % 97) continue;
@@ -14133,6 +14144,9 @@ int main(int argc, char** argv) {
             const uint64_t file_bytes0 = src.file_read_bytes();
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             const int64_t offload0 = drive.d.offload_entries;   // #588
+            // the page cache's share of this request's file-tier reads (counted with io_stats: io prefetch, the
+            // warm set, STRATA_IO_STATS=1)
+            const strata::core::FileExpertSource::IoCounters warm0 = src.io_counters();
             pcie_auto.mark(drive.d.ms_run, drive.d.multi_misses);   // the prompt's windows are not the decode's
             if (cancelled) finish = nf_hit ? "nonfinite" : "cancel";
             // ======== --pipeline-windows 2: the decode windows with the two cards overlapped ========
@@ -15282,20 +15296,29 @@ int main(int argc, char** argv) {
             //      chunk=<tokens> experts_streamed=<blobs>   (key=value, last: the first chunk of the request's longest
             //      batched segment, 0 when it read none; the expert blobs its prompt read copied host -> device on
             //      every stage - not the CPU share's, the stage helper's or a --peer-device peer's)
+            //      warm=<hits>/<reads>   (key=value: of the file-tier blobs this request read, how many the page
+            //      cache held whole - the warm set's hit rate; absent when the page cache is not counted)
             char chain_txt[128] = "";
             if (o.lookup_chain > 0)
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
+            char warm_txt[64] = "";
+            if (srcp == &src && src.io_stats()) {
+                const strata::core::FileExpertSource::IoCounters w = src.io_counters();
+                std::snprintf(warm_txt, sizeof warm_txt, " warm=%llu/%llu",
+                              (unsigned long long) (w.warm_blobs - warm0.warm_blobs),
+                              (unsigned long long) (w.blobs - warm0.blobs));
+            }
             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s chunk=%lld "
-                        "experts_streamed=%lld\n",
+                        "experts_streamed=%lld%s\n",
                         (long long) produced_n,
                         (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
                         (long long) resume, (long long) req_hits, (long long) req_look,
                         (long long) (src.ram_reads() - ram0), (long long) (src.file_reads() - files0),
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
                         (long long) req_offload, chain_txt, (long long) req_chunk,
-                        (long long) (sp.chain_experts_streamed() - streamed0));
+                        (long long) (sp.chain_experts_streamed() - streamed0), warm_txt);
             std::fflush(stdout);
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
@@ -15509,8 +15532,19 @@ int main(int argc, char** argv) {
                                      (double) ic.pf_budget_bytes / 1048576.0);
                     std::fprintf(stderr, "\n");
                     io_prev = io_now;
-                    ic_prev = ic;
                     fb_prev = fb;
+                }
+                // the warm set's scorecard, in blobs: a read the page cache held in full never left RAM; the cold
+                // ones are the storage traffic the set failed to absorb (their not-cached MB are the line above's).
+                // Its own counts (io_stats), not the OS's above: it prints where /proc/self/io does not exist too.
+                if (src.io_stats()) {
+                    const uint64_t nb = ic.blobs - ic_prev.blobs, nw = ic.warm_blobs - ic_prev.warm_blobs;
+                    if (nb > 0)
+                        std::fprintf(stderr, "strata serve: file tier reads this request: %llu warm in the page cache "
+                                             "of %llu (%.0f%%), %llu cold from storage\n",
+                                 (unsigned long long) nw, (unsigned long long) nb,
+                                 100.0 * (double) nw / (double) nb, (unsigned long long) (nb - nw));
+                    ic_prev = ic;
                 }
             }
             static const bool cold_log = std::getenv("STRATA_COLD_OVERLAP") != nullptr || std::getenv("STRATA_IO_STATS") != nullptr;

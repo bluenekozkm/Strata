@@ -987,8 +987,12 @@ int FileExpertSource::spans(int64_t layer, int64_t expert, Span* out) const {
             const uint8_t* p = role_ptr_[i] + (size_t) ((uint64_t) expert * per);
             const size_t f = (size_t) role_file_[i];
             // the io paths read through their own fds; without them the mapping's own fd stands in (the warm
-            // set's fadvise), unless drop_mapping closed it
+            // set's fadvise), unless drop_mapping closed it (Map has no fd on Windows)
+#if defined(_WIN32)
+            const int fd = f < io_fds_.size() ? io_fds_[f] : -1;
+#else
             const int fd = f < io_fds_.size() ? io_fds_[f] : (f < maps_.size() && !maps_[f].closed ? maps_[f].fd : -1);
+#endif
             out[r] = {p, per, fd, (uint64_t) (p - maps_[f].base), at};
             at += per;
         }
@@ -996,7 +1000,11 @@ int FileExpertSource::spans(int64_t layer, int64_t expert, Span* out) const {
     }
     const uint8_t* b = mapped_blob(layer, expert);
     if (b == nullptr) return 0;
+#if defined(_WIN32)
+    const int fd = !io_fds_.empty() ? io_fds_[0] : -1;   // fd_ does not exist on Windows
+#else
     const int fd = !io_fds_.empty() ? io_fds_[0] : fd_;
+#endif
     out[0] = {b, layer_blob_bytes_[(size_t) layer], fd, (uint64_t) (b - base_), 0};
     return 1;
 }
@@ -1022,6 +1030,8 @@ FileExpertSource::IoCounters FileExpertSource::io_counters() const {
     IoCounters c;
     c.cached_bytes = io_cached_.load(std::memory_order_relaxed);
     c.uncached_bytes = io_uncached_.load(std::memory_order_relaxed);
+    c.blobs = io_blobs_.load(std::memory_order_relaxed);
+    c.warm_blobs = io_warm_blobs_.load(std::memory_order_relaxed);
     c.pread_bytes = io_pread_bytes_.load(std::memory_order_relaxed);
     c.pread_us = io_pread_us_.load(std::memory_order_relaxed);
     c.pread_n = io_pread_n_.load(std::memory_order_relaxed);
@@ -1345,6 +1355,8 @@ const uint8_t* FileExpertSource::io_blob(int64_t layer, int64_t expert) {
         if (b != nullptr) {
             const uint64_t total = layer_blob_bytes_[(size_t) layer];
             io_cached_.fetch_add(total, std::memory_order_relaxed);
+            io_blobs_.fetch_add(1, std::memory_order_relaxed);
+            io_warm_blobs_.fetch_add(1, std::memory_order_relaxed);
             file_read_bytes_.fetch_add(total, std::memory_order_relaxed);
             return b;
         }
@@ -1613,6 +1625,7 @@ void FileExpertSource::close() {
     file_blob_bytes_.store(0);
     file_us_.store(0);
     io_cached_.store(0); io_uncached_.store(0); io_pread_bytes_.store(0); io_pread_us_.store(0); io_pread_n_.store(0);
+    io_blobs_.store(0); io_warm_blobs_.store(0);
     io_pf_jobs_.store(0); io_pf_blobs_.store(0); io_pf_skips_.store(0); io_pf_dropped_.store(0);
     io_pf_used_.store(0); io_pf_unused_.store(0); io_crit_us_.store(0); io_crit_n_.store(0);
 #if defined(_WIN32)
@@ -1747,8 +1760,10 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
     if (io_pf_ || io_stats_) {   // count what the page cache holds; with io prefetch, read what it does not with pread
         Span sp[3];
         const int ns = spans(layer, expert, sp);
+        bool full = ns > 0;
         for (int i = 0; i < ns; ++i) {
             const uint64_t res = resident_in(sp[i].p, sp[i].n);
+            if (res < sp[i].n) full = false;
             io_cached_.fetch_add(res, std::memory_order_relaxed);
             io_uncached_.fetch_add(sp[i].n - res, std::memory_order_relaxed);
             const bool dec = in_decode();
@@ -1769,6 +1784,8 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
             }
             std::memcpy(dst + sp[i].at, sp[i].p, (size_t) sp[i].n);
         }
+        io_blobs_.fetch_add(1, std::memory_order_relaxed);
+        if (full) io_warm_blobs_.fetch_add(1, std::memory_order_relaxed);
         if (ns > 0) return true;
     }
 #endif
@@ -2109,7 +2126,11 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
             if (complement_ready_ && resident_blob(index) != nullptr) continue;
             if (!override_.empty() && override_[index] != nullptr) continue;
             uint64_t total = 0;
-            if (cached_bytes(layer, e, total, false) >= total) continue;
+            io_blobs_.fetch_add(1, std::memory_order_relaxed);   // the warm set's scorecard: a demanded file-tier read
+            if (cached_bytes(layer, e, total, false) >= total) {
+                io_warm_blobs_.fetch_add(1, std::memory_order_relaxed);   // the page cache holds it whole: no storage read
+                continue;
+            }
             io_pf_demand_.fetch_add(1, std::memory_order_relaxed);
             io_enqueue(layer, e);
         }
@@ -2286,7 +2307,11 @@ bool FileExpertSource::zc_roles(int64_t layer, int64_t expert, const uint8_t** p
     file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
     if (complement_ready_) file_reads_.fetch_add(1, std::memory_order_relaxed);
     reads_.fetch_add(1, std::memory_order_relaxed);
-    if (io_stats_) io_cached_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+    if (io_stats_) {
+        io_cached_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+        io_blobs_.fetch_add(1, std::memory_order_relaxed);
+        io_warm_blobs_.fetch_add(1, std::memory_order_relaxed);
+    }
     if (gate_on_ && tl_decode) gate_c_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
     return true;
 }
@@ -4500,6 +4525,7 @@ int FileExpertSource::tier_of(int64_t layer, int64_t expert) const {
 
 void FileExpertSource::willneed(int64_t layer, int64_t expert) {
 #if defined(__linux__)
+    if (!warms()) return;   // unbuffered O_DIRECT reads never see the page cache: the advice would readahead for nothing
     if (layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return;
     Span sp[3];
     const int ns = spans(layer, expert, sp);
@@ -4516,8 +4542,11 @@ void FileExpertSource::chill(int64_t layer, int64_t expert) {
         return;
     Span sp[3];
     const int ns = spans(layer, expert, sp);
+    // the kernel's page size, not 4096: madvise EINVALs on a misaligned 64K-page kernel (and stays silent here)
+    const long sc = ::sysconf(_SC_PAGESIZE);
+    const uintptr_t pg = sc > 0 ? (uintptr_t) sc : 4096;
     for (int i = 0; i < ns; ++i) {
-        const uintptr_t pg = 4096, a = (uintptr_t) sp[i].p & ~(pg - 1);
+        const uintptr_t a = (uintptr_t) sp[i].p & ~(pg - 1);
         (void) madvise((void*) a, (size_t) ((uintptr_t) sp[i].p + sp[i].n - a), MADV_DONTNEED);
         // madvise only zaps this process's page tables: mincore (tier_of, the io counters) still reads the pages as
         // cached until the fadvise drops them from the page cache (a mapped page is skipped there, hence the order)
@@ -4637,6 +4666,8 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
                     const uint64_t c = cached_bytes(layer, expert, total);
                     io_cached_.fetch_add(c, std::memory_order_relaxed);
                     io_uncached_.fetch_add(total - c, std::memory_order_relaxed);
+                    io_blobs_.fetch_add(1, std::memory_order_relaxed);
+                    if (c >= total) io_warm_blobs_.fetch_add(1, std::memory_order_relaxed);
                 }
 #endif
             }
