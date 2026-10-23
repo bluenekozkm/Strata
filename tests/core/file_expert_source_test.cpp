@@ -1085,6 +1085,84 @@ void test_budget_lend_first() {
     std::cout << "budget lend first: PASS\n";
 }
 
+// warm-set tiering: the experts.bin mmap tier is a stager regime of its own - streams_mapping() gates the flip,
+// pread_blob fills the caller's buffer straight from the file (but answers false for a blob the RAM complement
+// holds), and cached_share can finally see this tier's residency (it answered -1 here before).
+void test_mapping_tier_pread() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    // the residency share needs pages the kernel can drop: the build tree's file system, not a tmpfs /tmp
+    TempDirectory dir(fs::current_path());
+    std::string err;
+    require(expert_layout_load(dir.path.string(), 1, 5, err), err);
+    const size_t bytes = (size_t) BLOB;
+    std::vector<std::vector<uint8_t>> truth(5, std::vector<uint8_t>(bytes));
+    {
+        std::ofstream out(dir.path / "experts.bin", std::ios::binary);
+        for (size_t e = 0; e < truth.size(); ++e) {
+            for (size_t i = 0; i < bytes; ++i) truth[e][i] = (uint8_t) ((i * 131u + e * 37u) ^ (i >> 8));
+            out.write((const char*) truth[e].data(), (std::streamsize) bytes);
+        }
+        require((bool) out, "fixture write failed");
+    }
+    FileExpertSource src;
+    require(src.open(dir.path.string(), 1, 5, err), err);
+    require(src.streams_mapping(), "the mapped experts.bin tier must say it streams the mapping");
+    std::vector<uint8_t> got(bytes, 0);
+    require(!src.pread_blob(-1, 0, got.data()) && !src.pread_blob(0, -1, got.data()) &&
+                !src.pread_blob(0, 5, got.data()) && !src.pread_blob(0, 0, nullptr),
+            "pread_blob accepted an invalid layer, expert or buffer");
+#if defined(__linux__)
+    require(src.pread_blob(0, 3, got.data()), "pread_blob refused a mapped blob");
+    require(got == truth[3], "pread_blob's bytes differ from the mapping");
+    // drop the write's own page cache, then one touched page must land the share in (0, 1).  The advice drops
+    // clean pages only: force the fresh fixture's writeback first, else the cold read is skipped.
+    if (int fd = ::open((dir.path / "experts.bin").c_str(), O_RDONLY); fd >= 0) {
+        (void) ::fsync(fd);
+        ::close(fd);
+    }
+    for (int64_t e = 0; e < 5; ++e) src.chill(0, e);
+    const double cold = src.cached_share(64);
+    if (cold >= 0.5) {   // the drop worked at all (a tmpfs fixture keeps every page and reads 1.0)
+        std::cout << "mapping tier: the chilled pages stayed cached (a tmpfs fixture); the residency share is not checked\n";
+    } else {
+        const uint8_t* b = src.blob(0, 3);
+        require(b != nullptr, "the residency fixture has no mapped blob");
+        // fault the blob's pages in, with the bytes' values actually used (a bare load is dead code and gets
+        // elided; and fault-around maps only already-cached pages, so one byte may read as warm as before)
+        uint64_t seen = 0;
+        for (size_t i = 0; i < bytes; i += 4096) seen = seen * 31 + b[i];
+        uint64_t want = 0;
+        for (size_t i = 0; i < bytes; i += 4096) want = want * 31 + truth[3][i];
+        require(seen == want, "the mapping moved under the residency check");
+        const double warm = src.cached_share(64);
+        require(warm > cold && warm < 1.0, "cached_share cannot see the mapping tier's residency");
+    }
+#else
+    require(!src.pread_blob(0, 3, got.data()), "pread_blob answered true on a platform without it");
+#endif
+    // a blob the RAM complement holds stays a memcpy job: pread_blob answers false for it, the file-tier ones
+    // keep preading, and the tier keeps saying it can flip regimes either way
+    ExpertCache cache;
+    require(cache.open(2, 1, 5, BLOB, err), err);
+    for (int e : {2, 3}) {
+        const int slot = cache.admit(0, e);
+        require(slot >= 0 && cache.fill_slot_blocking(slot, truth[(size_t) e].data(), err), err);
+    }
+    const std::vector<std::pair<int32_t, int32_t>> rank{{0, 0}, {0, 1}, {0, 2}, {0, 3}, {0, 4}};
+    require(src.pin_cache_complement(cache, err, false, {}, -1, 0, 2 * bytes, &rank), err);
+    require(src.has_resident(0, 0) && src.has_resident(0, 1) && !src.has_resident(0, 4), "complement fixture wrong");
+    require(!src.pread_blob(0, 0, got.data()), "pread_blob took a blob the RAM complement holds");
+#if defined(__linux__)
+    require(src.pread_blob(0, 4, got.data()) && got == truth[4], "pread_blob changed for a blob outside the complement");
+#endif
+    require(src.streams_mapping(), "the complement changed the tier's regime gate");
+    std::cout << "mapping tier: streams_mapping + pread_blob + cached_share: PASS\n";
+    src.close();
+    cache.close();
+    require(!src.streams_mapping(), "a closed source must not say it streams a mapping");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1103,6 +1181,7 @@ int main(int argc, char** argv) {
         test_io_prefetch();
         test_warm_advice();
         test_budget_lend_first();   // a small cache and a tiny fixture: run by default, not only under --rotation-gpu
+        test_mapping_tier_pread();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
 #endif

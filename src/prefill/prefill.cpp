@@ -525,11 +525,40 @@ struct Alloc {
 
 }  // namespace
 
+// The stager's SSD-profile decision - the once-per-process init pick and the chunk-boundary re-pick run this one
+// helper so they cannot drift: many threads and deep reads only for blobs that really are page faults on a disk.
+// `guards` false keeps the env-pinned pick (STRATA_STAGER_THREADS set: no sampling, no override).
+static bool stager_ssd_profile(core::ExpertSource* src, int64_t n_layers, int64_t n_expert, bool guards) {
+    if (src == nullptr) return false;
+    bool files = false;
+    if (src->streams_mapping())   // the mmap-experts tier: transient() is false for every blob, the chunk streams the mapping all the same
+        files = true;
+    else
+        for (int64_t l = 0; !files && l < n_layers; ++l)
+            for (int64_t e = 0; !files && e < n_expert; ++e) files = src->transient(l, e);
+    // #1353: a source can answer transient() for every blob it copies - or, on the mmap-experts tier, memcpy out
+    // of the mapping - while the page cache already holds the pages (a Q8 pack on a big-RAM box with a warm
+    // cache).  Those copies are memcpy from RAM, where 32 threads and a 128-deep ring ran 4-7x slower than the
+    // defaults.  So ask the OS: the SSD profile only when fewer than 90% of a sample of the blobs' pages are
+    // resident (-1: it cannot tell, keep it).  STRATA_STAGER_SSD = 1 / 0 forces the answer (A/B, support).
+    if (files && guards) {
+        const char* ev = std::getenv("STRATA_STAGER_SSD");
+        if (ev != nullptr && ev[0] != '\0') files = ev[0] != '0';
+        else if (const double warm = src->cached_share(256); warm >= 0.9) {
+            files = false;
+            std::fprintf(stderr, "prefill: the %s experts are %.0f%% in the page cache; the stager takes the RAM profile\n",
+                         src->streams_mapping() ? "mapped" : "GGUF", warm * 100.0);
+        }
+    }
+    return files;
+}
+
 // Step 4 of the prompt-speed plan: the experts the arena could not pin (a third of the streamed ones on IQ3_S) are
 // copied into pinned buffers by these threads, ahead of the launches.  Copied in line by the launching thread they
 // left the GPU without queued work while each ~2 MB memcpy ran (~15 s of a 32K prompt on IQ3_S).  Job j - a layer's
-// j-th unpinned expert, in launch order - lands in host buffer j % kRing, which is free again once the DMA of job
-// j - kRing (recorded by the launching thread, `issued`) is done.
+// j-th unpinned expert, in launch order - lands in host buffer j % run_ring, which is free again once the DMA of
+// job j - run_ring (recorded by the launching thread, `issued`) is done.  run_ring is the active regime's ring: the
+// buffers are allocated for kRing once, and a regime re-pick may run a shallower ring inside them.
 struct Stager {
     // D-5: the pinned ring's depth (STRATA_STAGER_RING, default 16) - how far the host copies can run ahead of the
     // DMAs of the unpinned experts' blobs
@@ -538,7 +567,8 @@ struct Stager {
     static constexpr int kMaxBatch = 32;
     int batch = 1;
     // `from` set: the blob is copied by the source itself (CS-T: a GGUF read in place assembles it from its three
-    // role slices; a pointer to it would not live as long as the queue)
+    // role slices; a pointer to it would not live as long as the queue).  l/e name the blob for the cold regime's
+    // whole-blob pread: set on every job, the (0,0) defaults are never read from storage
     struct Job { const uint8_t* src; size_t bytes; core::ExpertSource* from = nullptr; int32_t l = 0, e = 0; };
     std::vector<uint8_t*> buf;
     std::vector<char> pinned;
@@ -557,6 +587,14 @@ struct Stager {
     std::condition_variable cv;
     std::vector<std::thread> threads;
     int device = 0;
+    // warm-set tiering: the knobs a chunk-boundary re-pick rewrites (written only while no jobs exist; the
+    // buffers and threads are sized once, for the deepest shape).  They mirror kRing / batch / every thread
+    // unless a re-pick is live - the experts.bin mmap tier, the one source whose page cache warms and collapses
+    // under a session.
+    int run_ring = 0, run_batch = 0, active_max = 0;
+    bool preads = false;                    // the cold regime: memcpy jobs take whole-blob preads instead
+    core::ExpertSource* pread_src = nullptr;
+    bool env_threads = false;               // STRATA_STAGER_THREADS: the once-per-process pick stands, no re-pick
 
     bool init(size_t blob_bytes, int nthreads) {
         if (const char* v = std::getenv("STRATA_STAGER_RING")) kRing = std::clamp(std::atoi(v), 2, 256);
@@ -576,15 +614,17 @@ struct Stager {
         }
         cudaGetDevice(&device);
         for (int t = 0; t < nthreads; ++t)
-            threads.emplace_back([this] {
+            threads.emplace_back([this, t] {
                 // --aux-cpus: the copy threads go to the spare CPUs with the other helpers; STRATA_AUX_STAGER=0 leaves them where
                 // they were created (a small spare set would then hold all of them: it limits the copy rate of a long read)
                 strata::platform::name_this_thread("strata-stage");
                 static const bool keep = [] { const char* v = std::getenv("STRATA_AUX_STAGER"); return v != nullptr && std::atoi(v) == 0; }();
                 if (keep) strata::aux_cpus::note_owned_thread();
                 else strata::aux_cpus::pin_current_thread();
-                work();
+                work(t);
             });
+        run_ring = kRing;
+        run_batch = std::min(batch, kRing);
         return true;
     }
     ~Stager() {
@@ -597,39 +637,41 @@ struct Stager {
             if (buf[i] && pinned[i]) cudaFreeHost(buf[i]);
         }
     }
-    void work() {
+    void work(int id) {
         cudaSetDevice(device);
         uint32_t seen = 0;
         for (;;) {
             {
                 std::unique_lock<std::mutex> lk(mu);
-                cv.wait(lk, [&] { return quit || gen != seen; });
+                // threads past the active regime's slot limit park here (idle threads measured 0 CPU in the
+                // capture); a re-pick that raises the limit wakes them
+                cv.wait(lk, [&] { return quit || (gen != seen && id < active_max); });
                 if (quit) return;
                 seen = gen;
             }
             for (;;) {
                 active.fetch_add(1, std::memory_order_acq_rel);
-                // pp-opt: a run of up to `batch` consecutive jobs (batch <= kRing, so the earliest unfinished run
-                // never waits for a buffer of its own)
+                // pp-opt: a run of up to `run_batch` consecutive jobs (run_batch <= run_ring, so the earliest
+                // unfinished run never waits for a buffer of its own)
                 int k = 1;
-                const int j = claim(seen, batch, k);
+                const int j = claim(seen, run_batch, k);
                 if (j < 0) { active.fetch_sub(1, std::memory_order_acq_rel); break; }
                 for (int i = j; i < j + k; ++i) {
                     // The copies run ahead of the DMAs, so most of these threads spend most of a prompt waiting here: sleep
                     // (atomic wait, and a blocking-sync event below), not a yield spin - 32 spinners took every core
                     // (Linux; see stager_sleep for Windows).
-                    if (i >= kRing) {   // job i - kRing's DMA from this buffer is queued
+                    if (i >= run_ring) {   // job i - run_ring's DMA from this buffer is queued
 #if defined(STRATA_ATOMIC_WAIT)
                         if (stager_sleep())
-                            for (int x; (x = issued.load(std::memory_order_acquire)) <= i - kRing;) issued.wait(x);
+                            for (int x; (x = issued.load(std::memory_order_acquire)) <= i - run_ring;) issued.wait(x);
                         else
 #endif
-                            while (issued.load(std::memory_order_acquire) <= i - kRing) std::this_thread::yield();
+                            while (issued.load(std::memory_order_acquire) <= i - run_ring) std::this_thread::yield();
                     }
                     // and done - for a generation's first kRing jobs that is the previous generation's last DMA from
                     // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP) or the DMA
                     // was a ring entry the routing skipped (an event never recorded returns at once)
-                    cudaEventSynchronize(dma_done[i % kRing]);
+                    cudaEventSynchronize(dma_done[i % run_ring]);
                 }
                 int32_t rl[kMaxBatch], re[kMaxBatch];
                 uint8_t* rd[kMaxBatch];
@@ -637,9 +679,19 @@ struct Stager {
                 core::ExpertSource* from = nullptr;
                 for (int i = j; i < j + k; ++i) {
                     const Job& jb = jobs[(size_t) i];
-                    if (jb.from == nullptr) { std::memcpy(buf[i % kRing], jb.src, jb.bytes); continue; }
+                    if (jb.from == nullptr) {
+                        uint8_t* dst = buf[(size_t) (i % run_ring)];
+                        // cold mmap-experts regime: the whole blob in one pread into the ring buffer.  The mapping
+                        // memcpy reads by ~4 KB fault, and the collapsed page cache streamed 47-53 GB of experts
+                        // at ~140-170 MB/s (TTFT 164-277 s): more faulting threads scaled the fault count, not the
+                        // bytes per fault (~550 MB/s at 3.2x the rate).  The buffered pread still repopulates the
+                        // cache the decode's mapping reads need.  false (the RAM complement, an exchange): memcpy
+                        if (preads && pread_src->pread_blob(jb.l, jb.e, dst)) continue;
+                        std::memcpy(dst, jb.src, jb.bytes);
+                        continue;
+                    }
                     from = jb.from;
-                    rl[nr] = jb.l; re[nr] = jb.e; rd[nr] = buf[i % kRing]; ++nr;
+                    rl[nr] = jb.l; re[nr] = jb.e; rd[nr] = buf[(size_t) (i % run_ring)]; ++nr;
                 }
                 if (nr > 0 && !from->copy_blobs(rl, re, rd, nr)) {
                     std::fprintf(stderr, "prefill: the expert source could not copy experts %d.. of layer %d\n", re[0], rl[0]);
@@ -679,15 +731,33 @@ struct Stager {
     /// Job j's bytes, in a pinned buffer (waits for the copy).
     const uint8_t* wait(int j) {
         while (!ready[(size_t) j].load(std::memory_order_acquire)) std::this_thread::yield();
-        return buf[j % kRing];
+        return buf[(size_t) (j % run_ring)];
     }
     /// The launching thread queued job j's DMA on `copy`: its buffer is free once that is done.
     void issued_one(int j, cudaStream_t copy) {
-        cudaEventRecord(dma_done[j % kRing], copy);
+        cudaEventRecord(dma_done[j % run_ring], copy);
         issued.store(j + 1, std::memory_order_release);
 #if defined(STRATA_ATOMIC_WAIT)
         issued.notify_all();
 #endif
+    }
+    /// The knobs one regime runs with.  Written only while no jobs exist - init, or a chunk boundary (finish()
+    /// has ended every layer, every wait() is done) - so a generation never sees them move.  `files`: the SSD
+    /// profile, every thread over a ring of 4*threads claiming batch-8 runs (QD32 of ~2 MB bulk reads; the drive
+    /// does 2.7 GB/s direct) against the RAM defaults (#1353: 32 threads over fully-resident pages ran 4-7x
+    /// slower).  The buffers are sized once for the deepest shape, so a re-pick only ever shrinks the ring;
+    /// STRATA_STAGER_RING / _BATCH win over a re-pick's writes.
+    void regime(bool files) {
+        const int hw = (int) std::thread::hardware_concurrency();
+        const int deep = std::max(1, (int) threads.size());
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            if (std::getenv("STRATA_STAGER_RING") == nullptr) run_ring = std::min(files ? 4 * deep : 16, kRing);
+            if (std::getenv("STRATA_STAGER_BATCH") == nullptr) run_batch = std::min(files ? 8 : 1, run_ring);
+            active_max = std::clamp(files ? deep : std::max(2, std::min(4, hw / 4)), 1, deep);
+            preads = files && pread_src != nullptr;
+        }
+        cv.notify_all();   // threads parked past active_max must notice a raised limit
     }
     /// No job is running after this (the end of a layer, or an early return in the middle of one).
     void finish() {
@@ -1440,26 +1510,16 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.stager = std::make_unique<Stager>();
         const int hw = (int) std::thread::hardware_concurrency();
         const char* stv = std::getenv("STRATA_STAGER_THREADS");   // D-5: the host copy threads of unpinned blobs
-        // A GGUF read in place (UD-Q4_K_XL beyond its RAM budget): most of a chunk's blobs are page faults on the
-        // SSD, so the copies need many reads in flight - 32 threads and a 128-deep ring read a 4K chunk in 29 s
-        // instead of 71 s on an RTX 5070 / NVMe PC (4 threads, 16 deep: the defaults, kept for every other source)
-        bool files = false;
-        for (int64_t l = 0; src != nullptr && !files && l < g.n_layers; ++l)
-            for (int64_t e = 0; !files && e < g.n_expert; ++e) files = src->transient(l, e);
-        // #1353: ... but a source answers transient() for every blob it copies out of the GGUF, including the ones whose
-        // pages are already in the page cache (a Q8 pack on a big-RAM box with a warm cache).  Those copies are memcpy
-        // from RAM, where 32 threads and a 128-deep ring ran 4-7x slower than the defaults.  So ask the OS: the SSD
-        // profile only when fewer than 90% of a sample of the blobs' pages are resident (-1: it cannot tell, keep it).
-        if (files && !stv) {
-            const char* ev = std::getenv("STRATA_STAGER_SSD");   // 1 / 0: force the profile (A/B, support)
-            if (ev != nullptr && ev[0] != '\0') files = ev[0] != '0';
-            else if (const double warm = src->cached_share(256); warm >= 0.9) {
-                files = false;
-                std::fprintf(stderr, "prefill: the GGUF experts are %.0f%% in the page cache; the stager takes the RAM profile\n", warm * 100.0);
-            }
-        }
-        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : std::max(2, std::min(4, hw / 4));
-        if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
+        // A GGUF read in place (UD-Q4_K_XL beyond its RAM budget), or the mmap-experts tier against a collapsed
+        // page cache: most of a chunk's blobs are page faults on the SSD, so the copies need many reads in flight
+        // - 32 threads and a 128-deep ring read a 4K chunk in 29 s instead of 71 s on an RTX 5070 / NVMe PC (4
+        // threads, 16 deep: the defaults, kept for every other source)
+        const bool mapping = src != nullptr && src->streams_mapping();
+        const bool files = stager_ssd_profile(src, g.n_layers, g.n_expert, stv == nullptr);
+        // the mmap-experts tier builds the deep shape once and re-picks at the chunk boundaries (its cache warms
+        // and collapses under one session): the knobs move, the threads and buffers never respawn
+        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files || mapping ? 32 : std::max(2, std::min(4, hw / 4));
+        if ((files || mapping) && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
         // pp-opt: with files, each thread claims runs of neighbouring blobs and reads them as one request (copy_blobs);
         // STRATA_STAGER_BATCH=1 is the A/B arm (one blob per request, as before)
         {
@@ -1467,8 +1527,11 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             const int want = bv ? std::atoi(bv) : files ? 8 : 1;
             m.stager->batch = std::clamp(want, 1, Stager::kMaxBatch);
         }
+        m.stager->pread_src = mapping ? src : nullptr;
+        m.stager->env_threads = stv != nullptr;
         if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
         m.stager->batch = std::min(m.stager->batch, m.stager->kRing);
+        m.stager->regime(files);
     }
     m.steps_host.resize(T * strata::kernels::kStepCount);
     m.steps_up.init(T * strata::kernels::kStepCount);
@@ -2682,6 +2745,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     if (hand_in_ == nullptr) stopped_at_ = -1;
     for (int64_t c0 = 0; c0 < n; c0 += C) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
+        // The stager is quiescent here (finish() ended the last layer, every wait() is done): the mmap-experts
+        // tier re-runs the regime pick at every chunk boundary.  A 16K prompt streams 47-53 GB of experts through
+        // a ~24 GB page cache, and the cache flips warm -> collapsed mid-session (the first request after a 16K
+        // run stalled); a chunk runs 14-40 s, the 256-sample mincore re-check costs sub-millisecond, and a 16K
+        // prompt is ~2 chunks, so a mid-prompt collapse is caught at the next one.  A flip only rewrites the
+        // stager's knobs: no reallocation, no respawn.
+        if (m.stager && !m.stager->env_threads && m.src != nullptr && m.src->streams_mapping())
+            m.stager->regime(stager_ssd_profile(m.src, g.n_layers, g.n_expert, true));
         // the first stage: end the run before this chunk (every chunk before it is handed on; the caller's drain
         // waits for the later stages to read them)
         if (c0 > 0 && hand_in_ == nullptr && stop_at_chunk && stop_at_chunk()) {
@@ -2947,7 +3018,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         if (!m.src->pinned(l, e)) {
                             job = (int) js.size();
-                            js.push_back({b, (size_t) lay0.blob_bytes(l)});
+                            // l/e ride along: the cold regime's worker preads the blob from storage by them
+                            js.push_back({b, (size_t) lay0.blob_bytes(l), nullptr, (int32_t) l, e});
                         }
                     }
                     seq.push_back({(int32_t) l, e, b, job});
@@ -4399,7 +4471,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                                 const uint8_t* b = m.src->blob_stable(l, e);
                                 if (!b) { err = "prefill: expert source has no blob"; return false; }
-                                js.push_back({b, (size_t) lay.blob_bytes(l)});
+                                // l/e ride along: the cold regime's worker preads the blob from storage by them
+                                js.push_back({b, (size_t) lay.blob_bytes(l), nullptr, (int32_t) l, e});
                             }
                             m.stager->start(std::move(js));
                         }

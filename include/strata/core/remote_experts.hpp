@@ -155,6 +155,12 @@ public:
         return from_helper(layer, expert) ? true : fallback_.transient(layer, expert);
     }
     double cached_share(int64_t samples) const override { return fallback_.cached_share(samples); }
+    bool streams_mapping() const override { return fallback_.streams_mapping(); }
+    bool pread_blob(int64_t layer, int64_t expert, uint8_t* dst) override {
+        // the forward is the fallback's plain answer: a blob a helper holds never gets here (transient() routes
+        // it into the copy_blobs jobs), so the fallback's own residency table decides
+        return fallback_.pread_blob(layer, expert, dst);
+    }
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) override;
     void prefetch(int64_t layer, const int64_t* experts, int64_t n) override {

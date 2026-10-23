@@ -1026,6 +1026,27 @@ uint64_t FileExpertSource::cached_bytes(int64_t layer, int64_t expert, uint64_t&
 #endif
 }
 
+// The whole blob in one pread into the caller's buffer (the prompt stager's cold regime: the drive serves ~2 MB
+// bulk reads at ~2.7 GB/s direct, where the mapping memcpy faults ~4 KB at a time - a collapsed page cache
+// streamed at ~550 MB/s even at 3.2x the fault rate).  False - the caller memcpy's from the mapping pointer -
+// when the bytes would not come from storage now: the RAM complement or an exchange holds them, the GGUF roles
+// are three slices with no one blob, the view is closed, or this OS has no pread here.
+bool FileExpertSource::pread_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+#if defined(__linux__)
+    if (dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    if (complement_ready_ && resident_blob(index) != nullptr) return false;
+    if (!override_.empty() && override_[index] != nullptr) return false;
+    Span sp[1];
+    if (spans(layer, expert, sp) != 1 || sp[0].fd < 0) return false;   // the GGUF (3 spans), a closed view, no fd
+    // not counted in file_read_bytes_ here: the job push's blob_stable already counted the blob, memcpy or pread
+    return pread_full(sp[0].fd, dst, sp[0].n, sp[0].off);
+#else
+    (void) layer; (void) expert; (void) dst;
+    return false;   // no whole-blob pread here: the stager keeps the memcpy path
+#endif
+}
+
 FileExpertSource::IoCounters FileExpertSource::io_counters() const {
     IoCounters c;
     c.cached_bytes = io_cached_.load(std::memory_order_relaxed);
@@ -3330,9 +3351,16 @@ bool FileExpertSource::transient(int64_t layer, int64_t expert) const {
     return override_.empty() || override_[index] == nullptr;
 }
 
+// warm-set tiering: the experts.bin mmap tier - the conditions under which mapped_blob hands out mapping
+// pointers.  The prompt stager's regime flip lives behind this answer: false restores the memcpy-from-mapping
+// path everywhere.
+bool FileExpertSource::streams_mapping() const {
+    return !gguf_mode() && base_ != nullptr && !unmapped_;
+}
+
 double FileExpertSource::cached_share(int64_t samples) const {
 #if defined(__linux__)
-    if (role_ptr_.empty() || unmapped_ || samples <= 0 || n_layers_ <= 0 || n_expert_ <= 0) return -1.0;
+    if (unmapped_ || samples <= 0 || n_layers_ <= 0 || n_expert_ <= 0) return -1.0;
     // an even spread over the (layer, expert) grid, every page of each of the expert's three slices through mincore
     const int64_t total = (int64_t) n_layers_ * (int64_t) n_expert_;
     const int64_t n = std::min<int64_t>(samples, total);
@@ -3341,6 +3369,23 @@ double FileExpertSource::cached_share(int64_t samples) const {
     for (int64_t s = 0; s < n; ++s) {
         const int64_t idx = std::min<int64_t>(total - 1, (s * total) / n + (s * 7919) % std::max<int64_t>(1, total / n));
         const int64_t layer = idx / n_expert_, expert = idx % n_expert_;
+        if (role_ptr_.empty()) {
+            // the experts.bin mapping tier (the prompt stager's warm guard): one contiguous blob per expert,
+            // sampled whether transient() says so or not - it answers false for every blob here
+            const uint8_t* p = mapped_blob(layer, expert);
+            if (p == nullptr) continue;
+            // the kernel's page size, not 4096: mincore EINVALs on a misaligned 64K-page kernel, and this would
+            // answer -1 for ever (the stager's warm guard would silently never fire)
+            const long sc = ::sysconf(_SC_PAGESIZE);
+            const uintptr_t pg = sc > 0 ? (uintptr_t) sc : 4096;
+            const uintptr_t a = (uintptr_t) p & ~(pg - 1);
+            const size_t len = (size_t) ((uintptr_t) p + layer_blob_bytes_[(size_t) layer] - a), np = (len + pg - 1) / pg;
+            vec.assign(np, 0);
+            if (mincore((void*) a, len, vec.data()) != 0) return -1.0;
+            pages += np;
+            for (unsigned char v : vec) resident += v & 1;
+            continue;
+        }
         if (!transient(layer, expert)) continue;
         for (int r = 0; r < 3; ++r) {
             const size_t i = (size_t) (3 * layer + r);

@@ -231,6 +231,20 @@ public:
     /// source cannot tell (not a file source, or no residency query on this OS).  The prompt path's stager uses it to
     /// pick the SSD profile (many threads, a deep ring) only for blobs that really are page faults on a disk.
     virtual double cached_share(int64_t samples) const { (void) samples; return -1.0; }
+    /// warm-set tiering: whether this source hands its blobs out as pointers into a file mapping it streams (the
+    /// experts.bin mmap tier).  That is the tier whose page cache warms and collapses under one session, so it is
+    /// the one whose prefill stager re-picks its regime at the chunk boundaries - memcpy from the mapping while
+    /// the cache holds the working set, whole-blob preads once it collapses.  This gates both pick and re-pick;
+    /// answering false keeps every consumer on today's path.
+    virtual bool streams_mapping() const { return false; }
+    /// The blob's bytes straight from storage into `dst` (one whole-blob pread; the prefill stager's cold regime,
+    /// where the mapping memcpy would read by ~4 KB fault).  False - and the caller memcpy's from the mapping
+    /// pointer `blob` handed out - when the bytes do not come from storage now (a RAM copy or an exchange holds
+    /// them), or this source cannot pread.
+    virtual bool pread_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+        (void) layer; (void) expert; (void) dst;
+        return false;
+    }
     /// Disk sessions: the files this source read its experts from, as (role, path), resolved by the loader itself
     /// - the pack's experts.bin, or every GGUF tensor native_experts.txt named, per layer and role
     /// ("expert blk.L.ffn_up").  Filled by open(); empty before.
@@ -911,6 +925,11 @@ public:
     bool pcie_layer(int64_t layer) const override;
     bool transient(int64_t layer, int64_t expert) const override;
     double cached_share(int64_t samples) const override;
+    /// warm-set tiering: the experts.bin mmap tier (the conditions `mapped_blob` answers under); the prompt
+    /// stager's regime flip lives behind this answer
+    bool streams_mapping() const override;
+    /// The whole blob in one pread into `dst` (the stager's cold regime); false: memcpy from the mapping pointer
+    bool pread_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     /// pp-opt, unbuffered: the file-tier blobs of the run in one read_direct batch (neighbours merged into one request)
     bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) override;
