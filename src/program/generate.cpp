@@ -2356,6 +2356,12 @@ int main(int argc, char** argv) {
     prime_hw_queues();
 #endif
     Options o;
+    // M5: the managed warm set's size, parsed once here so the --resident-budget-gib headroom raise below and the
+    // serve loop's warm set cannot drift apart
+    if (const char* v = std::getenv("STRATA_WARM_SET_GIB"); v != nullptr && v[0] != '\0') {
+        const double gib = std::atof(v);
+        o.warm_set_bytes = gib > 0.0 ? (uint64_t) (gib * 1073741824.0) : 0ull;
+    }
     bool have_tokens = false;
     bool have_logits_stride = false;
     for (int i = 1; i < argc; ++i) {
@@ -2740,12 +2746,6 @@ int main(int argc, char** argv) {
             return 2;
         }
         }
-    }
-    // M5: the managed warm set's size, parsed once here so the --resident-budget-gib headroom raise above and the
-    // serve loop's warm set cannot drift apart
-    if (const char* v = std::getenv("STRATA_WARM_SET_GIB"); v != nullptr && v[0] != '\0') {
-        const double gib = std::atof(v);
-        o.warm_set_bytes = gib > 0.0 ? (uint64_t) (gib * 1073741824.0) : 0ull;
     }
 #if defined(STRATA_USE_HIP)
     {   // gfx1151 (Strix Halo): the switches that are exact there are on by default (strata/core/arch_defaults.hpp); before
