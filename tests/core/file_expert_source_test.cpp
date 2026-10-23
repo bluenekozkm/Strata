@@ -8,6 +8,11 @@
 #include "ggml.h"
 #endif
 
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #include <cuda_runtime.h>
 #include <cstdlib>
 #include <cstring>
@@ -982,6 +987,104 @@ void test_replace_resident(bool pin) {
     std::cout << "replace_resident: pinned=" << pin << " exact_bytes=PASS\n";
 }
 
+void test_warm_advice() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    // the advice drops a file's page-cache pages (fadvise), which tmpfs does not have: put the fixture on the
+    // build tree's file system, and skip the cold read when it is a tmpfs anyway
+    TempDirectory dir(fs::current_path());
+    std::string err;
+    require(expert_layout_load(dir.path.string(), 1, 5, err), err);
+    const size_t bytes = (size_t) BLOB;
+    {
+        std::ofstream out(dir.path / "experts.bin", std::ios::binary);
+        for (size_t e = 0; e < 5; ++e) {
+            std::vector<uint8_t> blob(bytes, (uint8_t) (0xAB + e));
+            out.write((const char*) blob.data(), (std::streamsize) bytes);
+        }
+        require((bool) out, "fixture write failed");
+    }
+#if defined(__linux__)
+    {   // the advice drops clean pages only: force the fresh fixture's writeback, else the cold read is skipped
+        if (int fd = ::open((dir.path / "experts.bin").c_str(), O_RDONLY); fd >= 0) {
+            (void) ::fsync(fd);
+            ::close(fd);
+        }
+    }
+#endif
+    FileExpertSource src;
+    require(src.open(dir.path.string(), 1, 5, err), err);
+    const uint8_t* b = src.blob(0, 0);
+    require(b != nullptr, "the warm-advice fixture has no mapped blob");
+#if defined(__linux__)
+    for (size_t i = 0; i < bytes; i += 4096) (void) b[i];   // fault the whole blob in: the source reads tier 1
+    require(src.tier_of(0, 0) == 1, "a faulted-in blob must read warm");
+    src.chill(0, 0);
+    // a tmpfs fixture (the build tree on one) ignores fadvise: the pages stay cached and the read stays warm
+    if (src.tier_of(0, 0) != 2)
+        std::cout << "warm advice: the chilled pages stayed cached (a tmpfs fixture); the cold read is not checked\n";
+    else
+        std::cout << "warm advice: chill hands the pages back, the tier reads follow\n";
+#endif
+    src.willneed(0, 0);   // advice only: it must not fail nor block
+    require(src.blob(0, 1) != nullptr, "the next blob must survive the advice");
+    src.chill(0, 1);      // and the no-op paths (unmapped bounds, other platforms) must be safe
+    src.close();
+    std::cout << "warm advice: PASS\n";
+}
+
+void test_budget_lend_first() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    TempDirectory dir;
+    std::string err;
+    require(expert_layout_load(dir.path.string(), 1, 5, err), err);
+    const size_t bytes = (size_t) BLOB;
+    std::vector<std::vector<uint8_t>> truth(5, std::vector<uint8_t>(bytes));
+    {
+        std::ofstream out(dir.path / "experts.bin", std::ios::binary);
+        for (size_t e = 0; e < truth.size(); ++e) {
+            for (size_t i = 0; i < bytes; ++i) truth[e][i] = (uint8_t) ((i * 131u + e * 37u) ^ (i >> 8));
+            out.write((const char*) truth[e].data(), (std::streamsize) bytes);
+        }
+        require((bool) out, "fixture write failed");
+    }
+    // the GPU cache holds experts 0..2 in slots 0..2; the prompt path lends the last two slots, so the lend
+    // region's experts are 1 and 2 and the complement is 3 and 4; a budget of two blobs covers one side only
+    const std::vector<std::pair<int32_t, int32_t>> rank{{0, 0}, {0, 1}, {0, 2}, {0, 3}, {0, 4}};
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool lend_first = pass == 0;
+#if defined(_WIN32)
+        _putenv_s("STRATA_BUDGET_LEND_FIRST", lend_first ? "1" : "0");
+#else
+        setenv("STRATA_BUDGET_LEND_FIRST", lend_first ? "1" : "0", 1);
+#endif
+        FileExpertSource src;
+        ExpertCache cache;
+        require(src.open(dir.path.string(), 1, 5, err), err);
+        require(cache.open(3, 1, 5, BLOB, err), err);
+        for (int e : {0, 1, 2}) {
+            const int slot = cache.admit(0, e);
+            require(slot >= 0 && cache.fill_slot_blocking(slot, truth[(size_t) e].data(), err), err);
+        }
+        require(src.pin_cache_complement(cache, err, false, {}, 1, 0, 2 * bytes, &rank), err);
+        if (lend_first)
+            require(src.has_resident(0, 1) && src.has_resident(0, 2) && !src.has_resident(0, 3) && !src.has_resident(0, 4),
+                    "lend first: the region's experts must take the budget before the ranked tail");
+        else
+            require(src.has_resident(0, 3) && src.has_resident(0, 4) && !src.has_resident(0, 1) && !src.has_resident(0, 2),
+                    "rank first (the env off): the ranked tail must keep its precedence");
+        src.close();
+        cache.close();
+    }
+#if defined(_WIN32)
+    _putenv_s("STRATA_BUDGET_LEND_FIRST", "0");
+#else
+    setenv("STRATA_BUDGET_LEND_FIRST", "0", 1);
+#endif
+    std::cout << "budget lend first: PASS\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -998,6 +1101,7 @@ int main(int argc, char** argv) {
         test_canonical_layout();
         test_unbuffered_reads();
         test_io_prefetch();
+        test_warm_advice();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
 #endif
@@ -1009,6 +1113,7 @@ int main(int argc, char** argv) {
             test_foresight_exchange(true);
             test_replace_resident(true);
             test_replace_resident(false);
+            test_budget_lend_first();
         }
         std::cout << "file_expert_source_test: PASS\n";
         return 0;

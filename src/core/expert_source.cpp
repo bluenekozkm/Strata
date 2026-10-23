@@ -986,14 +986,18 @@ int FileExpertSource::spans(int64_t layer, int64_t expert, Span* out) const {
             const uint64_t per = role_bytes_[i];
             const uint8_t* p = role_ptr_[i] + (size_t) ((uint64_t) expert * per);
             const size_t f = (size_t) role_file_[i];
-            out[r] = {p, per, f < io_fds_.size() ? io_fds_[f] : -1, (uint64_t) (p - maps_[f].base), at};
+            // the io paths read through their own fds; without them the mapping's own fd stands in (the warm
+            // set's fadvise), unless drop_mapping closed it
+            const int fd = f < io_fds_.size() ? io_fds_[f] : (f < maps_.size() && !maps_[f].closed ? maps_[f].fd : -1);
+            out[r] = {p, per, fd, (uint64_t) (p - maps_[f].base), at};
             at += per;
         }
         return 3;
     }
     const uint8_t* b = mapped_blob(layer, expert);
     if (b == nullptr) return 0;
-    out[0] = {b, layer_blob_bytes_[(size_t) layer], io_fds_.empty() ? -1 : io_fds_[0], (uint64_t) (b - base_), 0};
+    const int fd = !io_fds_.empty() ? io_fds_[0] : fd_;
+    out[0] = {b, layer_blob_bytes_[(size_t) layer], fd, (uint64_t) (b - base_), 0};
     return 1;
 }
 
@@ -3544,6 +3548,41 @@ bool FileExpertSource::pin_cache_complement(
         std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
         uint64_t at = 0;
         int64_t held = 0;
+        // STRATA_BUDGET_LEND_FIRST=1: the prompt path's lend region is admitted into the budget before the ranked
+        // tail.  Rank precedence filled a small budget exactly on the ranked experts and left the region empty: on a
+        // 32 GB PC with a 5 GiB budget (TQ2_0, a 16 GB card) all 2,748 lend slots read their experts from the pack on
+        // every prompt chunk (the #669 warning, ~3x slower prompts measured there), while the ranked experts it
+        // replaced included pairs the conversation never routed to.  The region first, then the rank (it skips what
+        // the region took); without the env the order below is unchanged.
+        const bool lend_first = [] {
+            const char* e = std::getenv("STRATA_BUDGET_LEND_FIRST");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
+        const bool lend_region = lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty();
+        auto admit_lend = [&] {
+            if (!lend_region) return;
+            budget_lendable = n_slots - lend_from_slot;
+            std::vector<size_t> order;   // the pairs in the lend region, highest slot first
+            for (size_t i = 0; i < primary_gpu_pairs.size(); ++i)
+                if (pair_slot[i] >= lend_from_slot && pair_slot[i] < n_slots) order.push_back(i);
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return pair_slot[a] > pair_slot[b]; });
+            const uint64_t at0 = at;
+            for (size_t i : order) {
+                const auto& pr = primary_gpu_pairs[i];
+                const size_t idx = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
+                const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
+                if (b > budget_bytes - at) break;   // a contiguous tail of the region: a short prompt lends only the last few
+                if (ranked[idx] != kNoComplement) continue;
+                ranked[idx] = at;
+                at += b;
+                ++budget_lent;
+            }
+            std::fprintf(stderr, "FileExpertSource: the prompt path's lend region: %lld of its %lld slots keep their experts "
+                                 "in RAM too (%.2f GiB of the budget's remaining %.2f GiB)\n",
+                         (long long) budget_lent, (long long) budget_lendable, (double) (at - at0) / 1073741824.0,
+                         (double) (budget_bytes - at0) / 1073741824.0);
+        };
+        if (lend_first) admit_lend();
         if (rank != nullptr)
             for (const auto& pr : *rank) {
                 if (pr.first < 0 || pr.second < 0 || pr.first >= n_layers_ || pr.second >= n_expert_) continue;
@@ -3569,29 +3608,9 @@ bool FileExpertSource::pin_cache_complement(
         // GiB of the budget stayed unused, and every agent turn read 0.5-2.6 GB of the 1,231 lent slots' experts (3.6
         // GiB) from the GGUF (a fresh 17K-token prompt 24 GB).  As the unbudgeted path does, take the lend region's
         // experts from the last slot down (the order the borrowing takes them) while they fit in what the budget has
-        // left; the ones past it keep the file fallback, and `rank` keeps its precedence (the hottest experts first).
-        if (lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty()) {
-            budget_lendable = n_slots - lend_from_slot;
-            std::vector<size_t> order;   // the pairs in the lend region, highest slot first
-            for (size_t i = 0; i < primary_gpu_pairs.size(); ++i)
-                if (pair_slot[i] >= lend_from_slot && pair_slot[i] < n_slots) order.push_back(i);
-            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return pair_slot[a] > pair_slot[b]; });
-            const uint64_t at0 = at;
-            for (size_t i : order) {
-                const auto& pr = primary_gpu_pairs[i];
-                const size_t idx = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
-                const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
-                if (b > budget_bytes - at) break;   // a contiguous tail of the region: a short prompt lends only the last few
-                if (ranked[idx] != kNoComplement) continue;
-                ranked[idx] = at;
-                at += b;
-                ++budget_lent;
-            }
-            std::fprintf(stderr, "FileExpertSource: the prompt path's lend region: %lld of its %lld slots keep their experts "
-                                 "in RAM too (%.2f GiB of the budget's remaining %.2f GiB)\n",
-                         (long long) budget_lent, (long long) budget_lendable, (double) (at - at0) / 1073741824.0,
-                         (double) (budget_bytes - at0) / 1073741824.0);
-        }
+        // left; the ones past it keep the file fallback, and `rank` keeps its precedence (the hottest experts first)
+        // unless STRATA_BUDGET_LEND_FIRST put the region first.
+        if (!lend_first) admit_lend();
         offsets.swap(ranked);
         bytes = at;
         lend_from_slot = -1;
@@ -4476,6 +4495,36 @@ int FileExpertSource::tier_of(int64_t layer, int64_t expert) const {
     return total > 0 && c >= total ? 1 : 2;
 #else
     return 2;
+#endif
+}
+
+void FileExpertSource::willneed(int64_t layer, int64_t expert) {
+#if defined(__linux__)
+    if (layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return;
+    Span sp[3];
+    const int ns = spans(layer, expert, sp);
+    for (int i = 0; i < ns; ++i) strata::platform::advise_willneed(sp[i].p, sp[i].n);
+#else
+    (void) layer; (void) expert;
+#endif
+}
+
+void FileExpertSource::chill(int64_t layer, int64_t expert) {
+#if defined(__linux__)
+    if (base_ == nullptr || unmapped_ || !direct_.empty() || layer < 0 || expert < 0 || layer >= n_layers_ ||
+        expert >= n_expert_)
+        return;
+    Span sp[3];
+    const int ns = spans(layer, expert, sp);
+    for (int i = 0; i < ns; ++i) {
+        const uintptr_t pg = 4096, a = (uintptr_t) sp[i].p & ~(pg - 1);
+        (void) madvise((void*) a, (size_t) ((uintptr_t) sp[i].p + sp[i].n - a), MADV_DONTNEED);
+        // madvise only zaps this process's page tables: mincore (tier_of, the io counters) still reads the pages as
+        // cached until the fadvise drops them from the page cache (a mapped page is skipped there, hence the order)
+        if (sp[i].fd >= 0) (void) posix_fadvise(sp[i].fd, (off_t) sp[i].off, (off_t) sp[i].n, POSIX_FADV_DONTNEED);
+    }
+#else
+    (void) layer; (void) expert;
 #endif
 }
 

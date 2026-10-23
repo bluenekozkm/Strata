@@ -338,6 +338,26 @@ GPU nor the RAM budget holds (only pages - the experts computed are the same; `S
 is what runs [Unsloth's UD-Q4_K_XL](UNSLOTH_Q4.md) (72 GiB of experts) on a 64 GB PC: 7-8.5 tokens/s at N = 40 on an
 RTX 5070, against ~3 tokens/s before these changes.
 
+**The prompt's lend region first (`STRATA_BUDGET_LEND_FIRST=1`):** the budget admits the ranked experts first and the
+lend region from what is left, so on a small box the budget filled exactly on the ranked tail and every lent slot read
+its expert from the pack on every prompt chunk (the `#669` warning; the 32 GB-class PC below printed `0 of 2748`). The
+env admits the region into the budget before the ranked tail, and the rank skips what the region took. Measured on an
+AMD Radeon 16 GiB (gfx1201), i5-12400F, 31 GiB RAM, a ~1.5 GB/s NVMe, TQ2_0 (29.9 GiB of experts), 131072 context,
+`tools/bench_tiers.py` suite, medians: at a 5 GiB budget the fresh 16K prompt reads 387 -> 468 tok/s and the agent
+session decodes 18.9 -> 19.7 tok/s; the short chat's decode gives back what the ranked tail lost, 32.2 -> 27.1 tok/s.
+
+**A managed warm set (`STRATA_WARM_SET_GIB=N`, the warm tier without a pinned copy):** every 8th adapt round
+(`STRATA_WARM_EVERY`) the pairs neither the GPU cache nor a RAM copy holds are ranked by the decayed routing, the
+hottest up to N GiB (capped by the RAM left less a 2 GiB floor) are asked for with `MADV_WILLNEED`, and advised pairs
+whose routing fell under `STRATA_WARM_FLOOR` (0.5) are handed back with `MADV_DONTNEED` plus
+`POSIX_FADV_DONTNEED` (the Linux files tier; a no-op elsewhere). The page cache then holds the warm set instead of the
+dead tail of an old prompt. Same box as above, against the plain mapped mode: the fresh 16K prompt 383 -> 549 tok/s,
+the agent session 18.7 -> 20.7 tok/s, the suite's storage reads 711 -> 637 GB (0.55 -> 0.51 of the expert reads), the
+short chat 23.2 -> 26.4 tok/s. A larger set was worse here (8 GiB: 16K 477, agent 19.5) - it starts evicting its own
+tail. Beside `--resident-budget-gib` the budget's headroom grows by the set plus 2 GiB, so the copy cannot starve the
+set: at budget 15 without it, 3.5 GiB of page cache were left for a 9.1 GiB file tier and the OS read 33 GB from
+storage for 7.7 GB of expert reads.
+
 **Opt-in switches measured on a hybrid Intel CPU under Windows (Core i7-13700K, 8 P + 8 E cores, RTX 5090, 64 GB RAM,
 Windows 11, Swift 1.5 IQ3_XXS at 128K):**
 - `--pool-affinity measure` (hybrid CPUs, native packs): the `all` and `p-cores` layouts are timed at start on the

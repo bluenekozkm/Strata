@@ -833,6 +833,12 @@ public:
     /// Where an expert outside the GPU is now: 0 the RAM copy, 1 the files with its pages in the page cache, 2 the files, cold
     /// (Linux: four sampled pages; elsewhere 2).
     int tier_of(int64_t layer, int64_t expert) const;
+    /// The managed warm set's advice on one pair's file pages (STRATA_WARM_SET_GIB).  `willneed` starts reading them
+    /// into the page cache; `chill` hands them back once the pair's routing went cold, so a small box's page cache
+    /// keeps the warm set instead of the dead tail.  Both are no-ops off the Linux mapped files (unbuffered reads
+    /// have no page cache to advise; Windows trims through `release`).
+    void willneed(int64_t layer, int64_t expert);
+    void chill(int64_t layer, int64_t expert);
     uint64_t blob_bytes(int64_t layer) const {
         return layer >= 0 && (size_t) layer < layer_blob_bytes_.size() ? layer_blob_bytes_[(size_t) layer] : 0;
     }

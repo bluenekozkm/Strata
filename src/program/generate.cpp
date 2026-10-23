@@ -2706,6 +2706,18 @@ int main(int argc, char** argv) {
                 o.resident_pin = false;
             if (const char* v = std::getenv("STRATA_RESIDENT_HEADROOM_GIB"); v != nullptr && std::atof(v) >= 0.0)
                 o.resident_headroom = (uint64_t) (std::atof(v) * 1073741824.0);
+            // M5: a managed warm set (STRATA_WARM_SET_GIB) lives in the page cache beside the copy - the budget's
+            // clamp and safety check must leave its room, or the copy starves the set and the cold tier falls back
+            // to the drive (measured 4.3x read amplification on a 32 GB PC at budget 15 with 3.5 GiB of cache left)
+            if (const char* v = std::getenv("STRATA_WARM_SET_GIB"); v != nullptr && std::atof(v) > 0.0) {
+                const uint64_t warm = (uint64_t) (std::atof(v) * 1073741824.0) + (2ull << 30);   // + 2 GiB floor
+                if (warm > o.resident_headroom) {
+                    o.resident_headroom = warm;
+                    std::fprintf(stderr, "strata generate: headroom raised to %.2f GiB: the %.2f GiB warm set and a "
+                                         "2 GiB floor live beside the budget (STRATA_WARM_SET_GIB)\n",
+                                 (double) o.resident_headroom / 1073741824.0, std::atof(v));
+                }
+            }
         }
         else if (a == "--stats") o.stats = true;
         else if (a == "--shared-late") o.shared_late = true;
@@ -10112,8 +10124,108 @@ int main(int argc, char** argv) {
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
         std::function<void()> adapt_fence;
         int64_t adapt_nswaps = 0;   // the blocking tier's swaps chosen, cumulative (the decode timing line's swaps/window)
+        // STRATA_WARM_SET_GIB: the managed warm tier between the VRAM cache and the files.  The engine picks the
+        // page cache's contents by advice instead of recency: every few adapt rounds the non-resident pairs the
+        // decayed routing ranks hottest are read ahead (MADV_WILLNEED, the deltas only, everything again every
+        // fourth refresh), and advised pairs whose routing went cold are handed back (MADV_DONTNEED) - on a small
+        // box the page cache then holds the warm set, not the dead tail of an old prompt.  Linux mapped files only;
+        // pairs the VRAM cache or the RAM copy holds are skipped (they are warmer than warm).  The async adaptive
+        // tier (--adapt-async) has its own chooser and does not run this.
+        const uint64_t warm_set_bytes = [] {
+            const char* v = std::getenv("STRATA_WARM_SET_GIB");
+            if (v == nullptr || v[0] == '\0') return 0ull;
+            const double gib = std::atof(v);
+            return gib > 0.0 ? (uint64_t) (gib * 1073741824.0) : 0ull;
+        }();
+        const int64_t warm_every = [] {
+            const char* v = std::getenv("STRATA_WARM_EVERY");
+            const int64_t n = v != nullptr && v[0] != '\0' ? std::atoll(v) : 8;
+            return n > 0 ? n : 8;
+        }();
+        const float warm_floor = [] {
+            const char* v = std::getenv("STRATA_WARM_FLOOR");
+            const float f = v != nullptr && v[0] != '\0' ? (float) std::atof(v) : 0.5f;
+            return f > 0.0f ? f : 0.5f;
+        }();
+        std::vector<uint8_t> warm_mark;   // the pairs the warm set advised: chill candidates when they go cold
+        int64_t warm_rounds = 0, warm_advised = 0, warm_chilled = 0;
+        if (warm_set_bytes > 0)
+            std::fprintf(stderr, "strata serve: the managed warm set: up to %.2f GiB of the file tier kept in the page "
+                                 "cache by advice, refreshed every %lldth adapt round, cold under %.2f of the decayed "
+                                 "routing (STRATA_WARM_SET_GIB)\n",
+                         (double) warm_set_bytes / 1073741824.0, (long long) warm_every, (double) warm_floor);
+        auto maintain_warm = [&]() {
+            if (warm_mark.empty() || srcp != &src) return;
+            if (warm_rounds++ % warm_every != 0) return;
+            // the set's size: the env's bytes against the RAM left beside the engine (2 GiB for everything else)
+            uint64_t budget = warm_set_bytes;
+            strata::core::detail::HostMemory hm;
+            if (strata::core::detail::host_available_memory(hm)) {
+                const uint64_t reserve = 2ull << 30;
+                budget = std::min(budget, hm.available > reserve ? hm.available - reserve : 0);
+            }
+            std::vector<uint8_t> next(warm_mark.size(), 0);
+            uint64_t at = 0;
+            int64_t advised = 0;
+            const bool reall = warm_rounds % (warm_every * 4) == 0;   // re-advise the whole set once in a while
+            std::vector<std::pair<float, int64_t>> cand;   // (decayed routing, pair index), hottest first
+            for (int64_t l = 0; l < g.n_layers; ++l) {
+                const float* u = drive.d.usage.data() + l * g.n_expert;
+                const int32_t* r = host_res.data() + l * g.n_expert;
+                for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                    if (r[e] >= 0) continue;                          // the VRAM cache holds it
+                    const size_t i = (size_t) l * (size_t) g.n_expert + (size_t) e;
+                    if (src.resident_blob(l, e) != nullptr) continue;   // the RAM copy holds it
+                    if (u[e] >= warm_floor) cand.emplace_back(u[e], (int64_t) i);
+                }
+            }
+            std::sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            for (const auto& c : cand) {
+                const int64_t l = c.second / (int64_t) g.n_expert, e = c.second % (int64_t) g.n_expert;
+                const uint64_t b = src.blob_bytes(l);
+                if (b == 0 || b > budget - at) continue;
+                const size_t i = (size_t) c.second;
+                if (reall || !warm_mark[i]) src.willneed(l, e);
+                next[i] = 1;
+                at += b;
+                ++advised;
+                if (at >= budget) break;
+            }
+            int64_t chilled = 0;
+            for (int64_t l = 0; l < g.n_layers; ++l) {
+                const float* u = drive.d.usage.data() + l * g.n_expert;
+                const int32_t* r = host_res.data() + l * g.n_expert;
+                for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                    const size_t i = (size_t) l * (size_t) g.n_expert + (size_t) e;
+                    if (!warm_mark[i] || next[i]) continue;
+                    if (u[e] < warm_floor && r[e] < 0 && src.resident_blob(l, e) == nullptr) {
+                        src.chill(l, e);   // cold, nobody holds it: the page cache can use its pages for the set
+                        ++chilled;
+                    } else {
+                        next[i] = 1;       // still warm, or another tier took it: keep it advised
+                    }
+                }
+            }
+            warm_advised += advised;
+            warm_chilled += chilled;
+            warm_mark.swap(next);
+            if (warm_rounds % (warm_every * 8) == 0) {   // the throttled report, with a tier sample of the set
+                int seen = 0, cached = 0;
+                for (int64_t i = 0; i < (int64_t) warm_mark.size() && seen < 128; ++i) {
+                    if (!warm_mark[(size_t) i] || (i % 97) != warm_rounds % 97) continue;
+                    const int t = src.tier_of(i / g.n_expert, i % g.n_expert);
+                    ++seen;
+                    cached += t <= 1;
+                }
+                std::fprintf(stderr, "strata serve: warm set: %lld pairs advised (%.2f GiB asked), %lld advised and "
+                                     "%lld chilled so far; the sample reads %d of %d from RAM or the page cache\n",
+                             (long long) advised, (double) at / 1073741824.0, (long long) warm_advised,
+                             (long long) warm_chilled, cached, seen);
+            }
+        };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
+            maintain_warm();
             if (!pending.empty()) return true;   // the previous swaps are still in flight
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; };
