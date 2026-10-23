@@ -543,12 +543,15 @@ static bool stager_ssd_profile(core::ExpertSource* src, int64_t n_layers, int64_
     // resident (-1: it cannot tell, keep it).  STRATA_STAGER_SSD = 1 / 0 forces the answer (A/B, support).
     if (files && guards) {
         const char* ev = std::getenv("STRATA_STAGER_SSD");
+        double warm = -1.0;
         if (ev != nullptr && ev[0] != '\0') files = ev[0] != '0';
-        else if (const double warm = src->cached_share(256); warm >= 0.9) {
-            files = false;
+        else if (warm = src->cached_share(256); warm >= 0.9) files = false;
+        // the mapped tier re-picks at every chunk boundary: say the RAM pick once per flip, not once per chunk
+        static std::atomic<int> said{-1};   // the last pick seen (1 SSD, 0 RAM); the prefill thread calls this
+        if (files) said.store(1, std::memory_order_relaxed);
+        else if (said.exchange(0, std::memory_order_relaxed) != 0)
             std::fprintf(stderr, "prefill: the %s experts are %.0f%% in the page cache; the stager takes the RAM profile\n",
                          src->streams_mapping() ? "mapped" : "GGUF", warm * 100.0);
-        }
     }
     return files;
 }
@@ -644,7 +647,7 @@ struct Stager {
             {
                 std::unique_lock<std::mutex> lk(mu);
                 // threads past the active regime's slot limit park here (idle threads measured 0 CPU in the
-                // capture); a re-pick that raises the limit wakes them
+                // capture); a re-pick's raised limit takes effect when the next start() bumps gen, not here
                 cv.wait(lk, [&] { return quit || (gen != seen && id < active_max); });
                 if (quit) return;
                 seen = gen;
@@ -757,7 +760,8 @@ struct Stager {
             active_max = std::clamp(files ? deep : std::max(2, std::min(4, hw / 4)), 1, deep);
             preads = files && pread_src != nullptr;
         }
-        cv.notify_all();   // threads parked past active_max must notice a raised limit
+        cv.notify_all();   // serves a concurrent quit; a raised active_max waits for start()'s gen bump
+                           // (gen is unchanged at a chunk boundary, so no parked predicate clears here)
     }
     /// No job is running after this (the end of a layer, or an early return in the middle of one).
     void finish() {

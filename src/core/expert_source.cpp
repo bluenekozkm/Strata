@@ -3366,6 +3366,10 @@ double FileExpertSource::cached_share(int64_t samples) const {
     const int64_t n = std::min<int64_t>(samples, total);
     uint64_t pages = 0, resident = 0;
     std::vector<unsigned char> vec;
+    // the kernel's page size, not 4096: mincore EINVALs on a misaligned 64K-page kernel, and this would
+    // answer -1 for ever (the stager's warm guard would silently never fire) - both tiers sample with it
+    const long sc = ::sysconf(_SC_PAGESIZE);
+    const uintptr_t pg = (uintptr_t) (sc > 0 ? sc : 4096);
     for (int64_t s = 0; s < n; ++s) {
         const int64_t idx = std::min<int64_t>(total - 1, (s * total) / n + (s * 7919) % std::max<int64_t>(1, total / n));
         const int64_t layer = idx / n_expert_, expert = idx % n_expert_;
@@ -3374,10 +3378,6 @@ double FileExpertSource::cached_share(int64_t samples) const {
             // sampled whether transient() says so or not - it answers false for every blob here
             const uint8_t* p = mapped_blob(layer, expert);
             if (p == nullptr) continue;
-            // the kernel's page size, not 4096: mincore EINVALs on a misaligned 64K-page kernel, and this would
-            // answer -1 for ever (the stager's warm guard would silently never fire)
-            const long sc = ::sysconf(_SC_PAGESIZE);
-            const uintptr_t pg = sc > 0 ? (uintptr_t) sc : 4096;
             const uintptr_t a = (uintptr_t) p & ~(pg - 1);
             const size_t len = (size_t) ((uintptr_t) p + layer_blob_bytes_[(size_t) layer] - a), np = (len + pg - 1) / pg;
             vec.assign(np, 0);
@@ -3391,7 +3391,7 @@ double FileExpertSource::cached_share(int64_t samples) const {
             const size_t i = (size_t) (3 * layer + r);
             if (role_ptr_[i] == nullptr || role_bytes_[i] == 0) continue;
             const uint8_t* p = role_ptr_[i] + (size_t) ((uint64_t) expert * role_bytes_[i]);
-            const uintptr_t pg = 4096, a = (uintptr_t) p & ~(pg - 1);
+            const uintptr_t a = (uintptr_t) p & ~(pg - 1);
             const size_t len = (size_t) ((uintptr_t) p + role_bytes_[i] - a), np = (len + pg - 1) / pg;
             vec.assign(np, 0);
             if (mincore((void*) a, len, vec.data()) != 0) return -1.0;
