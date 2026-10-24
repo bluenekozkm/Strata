@@ -284,9 +284,10 @@ while it pays (at least 128 MB read ahead in 16 windows and 10% of it used, `STR
 windows when it closed for that). Closed, the decode reads as it did without io prefetch (the look-ahead predicts one layer
 and warms with an madvise hint); the prompt path keeps its preads either way. The gate also closes while the free pages
 (`MemFree`) are at or under the file tier's reserve - a sixteenth of the RAM, between 1 and 4 GiB,
-`STRATA_IO_PF_RESERVE_GIB` - and opens again only above twice the reserve; a window's speculative bytes stay under a
-quarter of the free pages above it. `MemAvailable` counts the clean cache the engine's own streaming fills, so a share
-test alone can stay open while the kernel has no page left to give; `mmap` reserves nothing, and every page the engine
+`STRATA_IO_PF_RESERVE_GIB` - and opens again only above twice the reserve; the speculative bytes a decode window admits
+stay under a quarter of the free pages above it, on the default pread / `madvise` path (`warm()`) and in the scheduled
+one (`STRATA_IO_PF_SCHED=1`, whose per-window budget further caps them by the measured drive rate). `MemAvailable` counts
+the clean cache the engine's own streaming fills, so a share test alone can stay open while the kernel has no page left to give; `mmap` reserves nothing, and every page the engine
 reads is its file-rss and part of its OOM score. Measured on an RTX PRO 5000 emulating a 12 GB
 card (`--expert-cache 4448`, Q2_0 GGUF in place, page cache dropped before each engine, RAM limited by a cgroup), the 0.2.0
 defaults against the 0.1.4x ones, 3 interleaved pairs, story / code / doc8k decode and 4K / 20K prompts: 32 GB of RAM
@@ -311,7 +312,9 @@ expert in a buffer and makes the layer wait for them; `STRATA_IO_PF_AHEAD=0` kee
 off (its gate, or the reserve above), the free pages are still watched: when they fall to half the reserve, the mapped
 experts' clean pages are handed back to the page cache (`madvise(MADV_DONTNEED)` + `POSIX_FADV_DONTNEED`) at most once per
 10 s and the read-ahead stays paused for 15 s, which costs a re-read from storage but leaves the kernel a page to give. The
-start also prints a warning when the mapped model files are more than 60% of the RAM. The per-request
+start also prints a warning when the mapped model files are more than 60% of the RAM. The server reads the engine's
+`oom_score_adj` when it starts it (`STRATA_OOM_SCORE_ADJ` asks for a value; lowering it below the inherited one needs
+`CAP_SYS_RESOURCE`) and names the mapped files, the reserve and that setting in its out-of-RAM note. The per-request
 log line "file tier I/O" shows what the OS read from the drive (/proc/self/io, major faults) against the engine's expert
 reads; `STRATA_IO_STATS=1` (or prefetch on) adds the page-cache hit / miss split (mincore) and the read-ahead used / unused counts.
 Measured (interleaved A/B, 10 pairs, 200-token greedy medians, page cache dropped before each run, memory limit by cgroup):

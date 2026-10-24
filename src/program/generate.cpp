@@ -5635,11 +5635,15 @@ int main(int argc, char** argv) {
 #endif
         // say it once at start when the mapped model files cannot fit in the page cache: `mmap` reserves nothing, the
         // pages read are file-rss and part of the OOM score, and the engine's own read-ahead then faults the allocation
-        // that kills it.  The file tier keeps a reserve free from here on.
-        if (const std::string oom_note = strata::core::detail::mapped_memory_warning(
-                src.mapped_bytes(), strata::core::detail::system_ram_bytes());
-            !oom_note.empty())
-            std::fprintf(stderr, "strata generate: WARNING: %s\n", oom_note.c_str());
+        // that kills it.  The file tier keeps a reserve free from here on.  Only the mapped, buffered path puts those
+        // pages in the process's file-rss: an unbuffered file tier, the Windows startup view, or a --resident-budget-gib
+        // copy (it bounds what the files contribute) would make the warning wrong, so it is left out there.
+        if (o.resident_budget == 0 && !src.unbuffered() && !src.startup_unbuffered()) {
+            if (const std::string oom_note = strata::core::detail::mapped_memory_warning(
+                    src.mapped_bytes(), strata::core::detail::system_ram_bytes());
+                !oom_note.empty())
+                std::fprintf(stderr, "strata generate: WARNING: %s\n", oom_note.c_str());
+        }
         // Linux I/O path: whole-blob preads instead of page faults, and the predicted experts of the next layers read
         // ahead on I/O threads while the current layer computes (see FileExpertSource::set_io_prefetch).  0.2.0: on by
         // default on Linux, with the decode gate (STRATA_IO_PF_GATE) and zero-copy page-cached experts
@@ -15505,8 +15509,9 @@ int main(int argc, char** argv) {
                 const uint64_t fb = src.file_read_bytes();
                 if (io_now.valid) {
                     std::fprintf(stderr, "strata serve: file tier I/O this request: the OS read %.1f MB from storage (%llu major faults) for "
-                                         "%.1f MB of expert reads", (double) (io_now.read_bytes - io_prev.read_bytes) / 1e6,
-                                 (unsigned long long) (io_now.major_faults - io_prev.major_faults), (double) (fb - fb_prev) / 1e6);
+                                         "%.1f MB of expert reads, %lld low-memory reliefs", (double) (io_now.read_bytes - io_prev.read_bytes) / 1e6,
+                                 (unsigned long long) (io_now.major_faults - io_prev.major_faults), (double) (fb - fb_prev) / 1e6,
+                                 (long long) src.stream_reliefs());
                     if (src.io_stats())
                         std::fprintf(stderr, "; page cache held %.1f MB at the read, not %.1f MB",
                                      (double) (ic.cached_bytes - ic_prev.cached_bytes) / 1e6,

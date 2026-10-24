@@ -391,6 +391,12 @@ void test_stream_memory_guard() {
     require(!speculative_read_clears(2 * GiB, 1 * GiB), "the read-ahead must not come back at exactly twice the reserve");
     require(speculative_read_clears(2 * GiB + 1, 1 * GiB), "the read-ahead must come back above twice the reserve");
     require(speculative_read_clears(0, 1 * GiB), "an unknown MemFree must let the read-ahead back");
+    // the gate's hysteresis: open it stays between the reserve and twice it, closed it stays closed there
+    require(speculative_gate_room(true, 3 * GiB, 1 * GiB), "an open gate must stay open well above twice the reserve");
+    require(speculative_gate_room(true, 3 * GiB / 2, 1 * GiB), "an open gate must stay open between the reserve and twice it");
+    require(!speculative_gate_room(true, 900 << 20, 1 * GiB), "an open gate must close at or under the reserve");
+    require(!speculative_gate_room(false, 3 * GiB / 2, 1 * GiB), "a closed gate must stay closed between the reserve and twice it");
+    require(speculative_gate_room(false, 21 * GiB / 10, 1 * GiB), "a closed gate must open above twice the reserve");
     // a window's speculative bytes: a quarter of the free pages above the reserve, never more than the caller's budget
     require(speculative_window_bytes(0, 1 * GiB, 64 << 20) == 64 << 20, "an unknown MemFree must leave the budget alone");
     require(speculative_window_bytes(1 * GiB, 1 * GiB, 64 << 20) == 0, "a budget at the reserve must be nothing");
@@ -728,17 +734,28 @@ void test_io_prefetch() {
     FileExpertSource source;
     require(source.open(dir.path.string(), layers, experts, err), "could not map the synthetic pack: " + err);
     // the read-ahead keeps 1-4 GiB free by default; a tiny reserve here, so the guard does not turn this test's
-    // predictions off on a build machine whose free pages are low
+    // predictions off on a build machine whose free pages are low.  The old value goes back (unset when it was unset):
+    // the rest of this binary must not inherit the test's env.
 #if defined(_WIN32)
+    char* old_reserve_raw = nullptr;
+    size_t old_reserve_len = 0;
+    _dupenv_s(&old_reserve_raw, &old_reserve_len, "STRATA_IO_PF_RESERVE_GIB");
+    const std::string old_reserve = old_reserve_raw != nullptr ? old_reserve_raw : "";
+    std::free(old_reserve_raw);
     _putenv_s("STRATA_IO_PF_RESERVE_GIB", "0.001");
 #else
+    const char* old_reserve_env = std::getenv("STRATA_IO_PF_RESERVE_GIB");
+    const std::string old_reserve = old_reserve_env != nullptr ? old_reserve_env : "";
     setenv("STRATA_IO_PF_RESERVE_GIB", "0.001", 1);
 #endif
     source.set_io_prefetch(true, 3);
+    require(source.stream_reserve() == (uint64_t) (0.001 * 1073741824.0),
+            "STRATA_IO_PF_RESERVE_GIB must size the reserve the first read-ahead sees");
 #if defined(_WIN32)
-    _putenv_s("STRATA_IO_PF_RESERVE_GIB", "0");
+    _putenv_s("STRATA_IO_PF_RESERVE_GIB", old_reserve.empty() ? "" : old_reserve.c_str());
 #else
-    setenv("STRATA_IO_PF_RESERVE_GIB", "0", 1);
+    if (old_reserve.empty()) unsetenv("STRATA_IO_PF_RESERVE_GIB");
+    else setenv("STRATA_IO_PF_RESERVE_GIB", old_reserve.c_str(), 1);
 #endif
 #if defined(__linux__)
     require(source.io_prefetch() && source.warms(), "io prefetch did not turn on");

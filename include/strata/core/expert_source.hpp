@@ -120,6 +120,9 @@ uint64_t stream_reserve_bytes(uint64_t total_ram);
 bool speculative_read_fits(uint64_t free_now, uint64_t reserve);
 /// Whether the read-ahead may come back after a close: the free pages have recovered to twice the reserve (hysteresis).
 bool speculative_read_clears(uint64_t free_now, uint64_t reserve);
+/// Whether the free pages keep the gate in the state it is in (`open`): an open gate closes at or under the reserve, a
+/// closed one stays closed until twice the reserve is free (the hysteresis of `speculative_read_fits`/`_clears`).
+bool speculative_gate_room(bool open, uint64_t free_now, uint64_t reserve);
 /// The speculative bytes one decode window may take: `want`, capped to a quarter of the free pages above `reserve`
 /// (0 when they are at or under it).
 uint64_t speculative_window_bytes(uint64_t free_now, uint64_t reserve, uint64_t want);
@@ -1078,11 +1081,12 @@ public:
     int64_t gate_closed_windows() const { return gate_closed_w_; }
     int64_t gate_flips() const { return gate_flips_; }
     /// The free RAM the file tier leaves for the kernel while it reads (`STRATA_IO_PF_RESERVE_GIB` overrides), the
-    /// MemFree the last decode window saw (0: unknown), and how many speculative reads that reserve refused since the
-    /// start.
+    /// MemFree the last decode window saw (0: unknown), how many speculative reads that reserve refused since the start,
+    /// and how often the last-resort relief handed the mapped pages back.
     uint64_t stream_reserve() const { return stream_reserve_; }
     uint64_t stream_free() const { return stream_free_.load(std::memory_order_relaxed); }
     int64_t stream_refusals() const { return stream_refusals_.load(std::memory_order_relaxed); }
+    int64_t stream_reliefs() const { return stream_reliefs_.load(std::memory_order_relaxed); }
     /// The bytes of the expert files this source maps: a pack's `experts.bin` mapping, or the GGUF in place's blobs.
     uint64_t mapped_bytes() const { return mapped_bytes_ != 0 ? mapped_bytes_ : expert_bytes(); }
 private:
@@ -1095,9 +1099,13 @@ private:
     uint64_t stream_reserve_ = 0;
     std::once_flag stream_once_;   ///< the reserve is computed once, whichever thread reads free memory first
     std::atomic<uint64_t> stream_free_{0};
+    /// Written by the decode thread (begin_layer/set_io_prefetch) and read from the stats; `stream_free_` and
+    /// `stream_reliefs_` are atomic because the lookahead thread's warm() may read them too.  The two timestamps below are
+    /// the decode thread's alone (stream_relieve and gate_tick both run from begin_layer).
     std::chrono::steady_clock::time_point stream_free_at_{};   ///< when stream_free_ was last read (throttles the read)
     std::atomic<int64_t> stream_refusals_{0};
-    int64_t stream_reliefs_ = 0;
+    std::atomic<int64_t> stream_reliefs_{0};
+    std::atomic<uint64_t> stream_win_bytes_{0};   ///< (atomic) speculative bytes warm() admitted in this decode window
     std::chrono::steady_clock::time_point stream_relief_at_{};
     std::chrono::steady_clock::time_point gate_hold_until_{};   ///< no read-ahead until then (after a relief)
     void gate_tick();

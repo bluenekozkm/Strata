@@ -142,6 +142,10 @@ bool speculative_read_clears(uint64_t free_now, uint64_t reserve) {
     return free_now == 0 || free_now > 2 * reserve;
 }
 
+bool speculative_gate_room(bool open, uint64_t free_now, uint64_t reserve) {
+    return open ? speculative_read_fits(free_now, reserve) : speculative_read_clears(free_now, reserve);
+}
+
 uint64_t speculative_window_bytes(uint64_t free_now, uint64_t reserve, uint64_t want) {
     if (free_now == 0) return want;
     const uint64_t room = free_now > reserve ? free_now - reserve : 0;
@@ -2119,12 +2123,12 @@ void FileExpertSource::gate_capacity() {
     // the share above is MemAvailable, which counts the clean file cache the engine's own streaming fills, so it can stay
     // high while the pages really free run out and the kernel's reclaim has stopped; the next read-ahead burst is then the
     // allocation that OOM-kills the engine.  The free pages therefore close the gate regardless of the share: at or under
-    // the reserve it closes, and it opens again only once twice the reserve is free (hysteresis; below that the state
-    // stays).  On a box with room the free pages never come near the reserve, so the share keeps its role.
+    // the reserve it closes, and it opens again only once twice the reserve is free (hysteresis; between the reserve and
+    // twice it the state stays).  Asking the state's own test matters: requiring both `fits` and `clears` would close the
+    // gate at 1-2x reserve whatever the state was.  On a box with room the free pages never come near the reserve, so the
+    // share keeps its role.
     const uint64_t free_now = stream_free_.load(std::memory_order_relaxed);
-    if (!detail::speculative_read_fits(free_now, stream_reserve_) ||
-        !detail::speculative_read_clears(free_now, stream_reserve_))
-        want = false;
+    if (!detail::speculative_gate_room(open, free_now, stream_reserve_)) want = false;
     if (want && std::chrono::steady_clock::now() < gate_hold_until_) want = false;
     if (want != open) { gate_open_.store(want, std::memory_order_relaxed); ++gate_flips_; }
 }
@@ -2137,7 +2141,8 @@ void FileExpertSource::gate_capacity() {
 // keep up: with the free pages at the min watermark and `all_unreclaimable`, one more fault or read-ahead burst of the
 // engine is the allocation that ends it.  Three things follow, all of them cheap:
 //   - the read-ahead and the madvise hints only run while MemFree is above the reserve (stream_reserve_bytes);
-//   - one decode window's speculative bytes stay under a quarter of the free pages above that reserve;
+//   - one decode window's speculative bytes stay under a quarter of the free pages above that reserve, on both the
+//     default path (warm()'s predictions) and the scheduled one (io_budget_now());
 //   - if the free pages still fall to half the reserve (another program grew, a burst of readahead already in flight),
 //     the mapped experts' clean pages are handed back to the page cache, which is the state the kernel was asking for.
 void FileExpertSource::stream_init() {
@@ -2165,7 +2170,7 @@ bool FileExpertSource::stream_may_read_ahead() {
 
 void FileExpertSource::stream_relieve() {
 #if defined(__linux__)
-    if (stream_reserve_ == 0) return;   // nothing read ahead here: nothing to give back
+    stream_init();   // the reserve this compares against (a no-op after the first start, whatever the caller)
     const uint64_t seen = stream_free_.load(std::memory_order_relaxed);
     if (seen != 0 && seen > stream_reserve_) return;   // well above the brink: no extra reading of /proc
     uint64_t free_now = 0;              // fresh, not the window's reading: this is the last check before the OOM killer
@@ -2173,9 +2178,9 @@ void FileExpertSource::stream_relieve() {
     stream_free_.store(free_now, std::memory_order_relaxed);
     if (free_now > stream_reserve_ / 2) return;   // not at the brink
     const auto now = std::chrono::steady_clock::now();
-    if (stream_reliefs_ > 0 && now - stream_relief_at_ < std::chrono::seconds(10)) return;
+    if (stream_reliefs_.load(std::memory_order_relaxed) > 0 && now - stream_relief_at_ < std::chrono::seconds(10)) return;
     stream_relief_at_ = now;
-    ++stream_reliefs_;
+    stream_reliefs_.fetch_add(1, std::memory_order_relaxed);
     gate_hold_until_ = now + std::chrono::seconds(15);   // the free pages get the room back before any read-ahead
     uint64_t released = 0;
     int files = 0;
@@ -3161,9 +3166,18 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
 void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
     if ((role_ptr_.empty() && !io_pf_) || n <= 0 || layer < 0 || layer >= n_layers_) return;
     // these are predictions - the page cache can do without them.  Under the reserve the demand reads are all the engine
-    // does (read_ahead_enabled()/gate_open() are separate switches for the same reads).
-    const bool may_read_ahead = stream_may_read_ahead();
-    if (!may_read_ahead) stream_refusals_.fetch_add(1, std::memory_order_relaxed);
+    // does (read_ahead_enabled()/gate_open() are separate switches for the same reads), and nothing is counted as warmed:
+    // there is no stamp for a prediction that never reached the page cache.
+    if (!stream_may_read_ahead()) {
+        stream_refusals_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // the scheduled path's warm_scored() caps its own budget; on the default path these predictions share a window's
+    // quarter of the free pages above the reserve here, where they enter the queue
+    const uint64_t window_cap = io_sched_ ? std::numeric_limits<uint64_t>::max()
+                                          : detail::speculative_window_bytes(stream_free_.load(std::memory_order_relaxed),
+                                                                             stream_reserve_,
+                                                                             std::numeric_limits<uint64_t>::max());
     uint32_t stamp;
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
@@ -3180,9 +3194,16 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
         const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
         if (complement_ready_ && resident_blob(index) != nullptr)
             continue;                                                    // in the RAM copy
+        if (!io_sched_) {   // this window's speculative bytes (0 bytes charged when the size is unknown)
+            const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
+            if (bytes != 0) {
+                const uint64_t used = stream_win_bytes_.load(std::memory_order_relaxed);
+                if (used + bytes > window_cap) break;   // the window's quarter is spent: the next one starts it over
+                stream_win_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+            }
+        }
         if (warm_stamp_) warm_stamp_[index].store(stamp, std::memory_order_relaxed);
         warm_count_.fetch_add(1, std::memory_order_relaxed);
-        if (!may_read_ahead) continue;   // the free pages are at the reserve: no pread, no madvise
         if (io_pf_ && direct_.empty() && gate_open()) {   // read it ahead with pread on the I/O threads (instead of an madvise hint)
             if (io_ahead_) io_enqueue(layer, e, true);
             continue;
@@ -3497,7 +3518,10 @@ void FileExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k)
             io_epoch_.store(epoch_, std::memory_order_relaxed);   // 149-prefetch: the workers' deadline clock
         }
     }
-    if (new_window) stream_update_free();   // the MemFree this window's read-ahead is judged by
+    if (new_window) {
+        stream_update_free();                                   // the MemFree this window's read-ahead is judged by
+        stream_win_bytes_.store(0, std::memory_order_relaxed);  // and the bytes warm() may still speculate this window
+    }
     if (new_window && io_sched_) io_window_tick();
     if (new_window && tl_decode) {
         stream_relieve();                   // the free pages are at the brink: hand the mapped experts' pages back

@@ -128,18 +128,20 @@ def set_oom_score_adj(pid: int, value: int) -> str:
 
 
 _OOM_ADVICE_SHOWN = False
+_OOM_ADVICE_LOCK = threading.Lock()   # two replicas starting together must not print it twice
 
 
 def oom_advice(pid: int) -> str:
     """Linux only: one sentence when the engine's oom_score_adj makes it the kernel's first pick, else "". Printed once
     per server run: the engine maps the experts, so its file-rss - not a leak - is what the kernel scores."""
     global _OOM_ADVICE_SHOWN
-    if _OOM_ADVICE_SHOWN:
-        return ""
-    adj = oom_score_adj(pid)
-    if adj is None or adj < 100:
-        return ""
-    _OOM_ADVICE_SHOWN = True
+    with _OOM_ADVICE_LOCK:
+        if _OOM_ADVICE_SHOWN:
+            return ""
+        adj = oom_score_adj(pid)
+        if adj is None or adj < 100:
+            return ""
+        _OOM_ADVICE_SHOWN = True
     return (f"The engine inherited oom_score_adj {adj}: when this PC runs out of RAM the kernel ends the engine first, "
             "and its mapped expert files count as its memory. Start the server under a decreasing setting, for example "
             "`systemd-run --user --scope -p OOMScoreAdjust=-500 -- strata serve ...`, or give it CAP_SYS_RESOURCE with "
@@ -1073,14 +1075,14 @@ class StrataEngine:
         # Linux: the kernel's OOM score of the engine, and what can be asked of it (the engine maps the experts, so its
         # file-rss is what the kernel scores; a leaked RAM figure it is not).
         want_adj = os.environ.get("STRATA_OOM_SCORE_ADJ", "").strip()
-        if want_adj:
+        if want_adj and oom_score_adj(self.proc.pid) is not None:   # nothing to ask where /proc has no such file
             try:
                 why = set_oom_score_adj(self.proc.pid, int(want_adj))
             except ValueError:
                 why = f"STRATA_OOM_SCORE_ADJ is not a number: {want_adj!r}"
             if why:
                 print(f"[strata] the engine keeps oom_score_adj {oom_score_adj(self.proc.pid)}: {why}", flush=True)
-        note = oom_advice(self.proc.pid)
+        note = "" if want_adj else oom_advice(self.proc.pid)   # the operator already chose a score: no advice
         if note:
             print("[strata] " + note, flush=True)
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
@@ -1291,8 +1293,9 @@ class StrataEngine:
         return ("The usual cause is running out of RAM: Linux then ends the biggest program (check: sudo dmesg | "
                 "grep -i -E 'killed process|out of memory'); Windows slows down instead. The mapped expert files count as "
                 "the engine's memory on Linux, and the file tier keeps a reserve free (STRATA_IO_PF_RESERVE_GIB, a "
-                "sixteenth of the RAM by default); with little RAM left, close other programs, lower --max-context, or "
-                "use a smaller model (Q2_0 / IQ2_XS).")
+                "sixteenth of the RAM by default); the kernel picks first the program with the highest oom_score_adj "
+                "(STRATA_OOM_SCORE_ADJ sets the engine's). With little RAM left, close other programs, lower "
+                "--max-context, or use a smaller model (Q2_0 / IQ2_XS).")
 
     def alive(self) -> bool:
         proc = self.proc                                 # read once: restart() / close() may set it to None meanwhile
