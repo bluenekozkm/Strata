@@ -374,6 +374,38 @@ void test_resident_exchange() {
     require(offsets == before, "exchanging back did not restore the plan");
 }
 
+// the file tier's memory guard: the reserve it keeps, and what the free pages allow
+void test_stream_memory_guard() {
+    using namespace strata::core::detail;
+    constexpr uint64_t GiB = 1ull << 30;
+    require(stream_reserve_bytes(0) == 1 * GiB, "an unknown RAM must give the smallest reserve");
+    require(stream_reserve_bytes(8 * GiB) == 1 * GiB, "a small host must keep 1 GiB");
+    require(stream_reserve_bytes(32 * GiB) == 2 * GiB, "a 32 GiB host must keep 2 GiB");
+    require(stream_reserve_bytes(64 * GiB) == 4 * GiB, "a 64 GiB host must keep 4 GiB");
+    require(stream_reserve_bytes(1024 * GiB) == 4 * GiB, "a very large host must keep at most 4 GiB");
+    // the read-ahead: unknown MemFree reads as before, at or under the reserve it stops, twice the reserve lets it back
+    require(speculative_read_fits(0, 1 * GiB), "an unknown MemFree must not stop the read-ahead");
+    require(speculative_read_fits(1 * GiB + 1, 1 * GiB), "the free pages just above the reserve must allow read-ahead");
+    require(!speculative_read_fits(1 * GiB, 1 * GiB), "a MemFree at the reserve must stop the read-ahead");
+    require(!speculative_read_fits(100 << 20, 1 * GiB), "a MemFree under the reserve must stop the read-ahead");
+    require(!speculative_read_clears(2 * GiB, 1 * GiB), "the read-ahead must not come back at exactly twice the reserve");
+    require(speculative_read_clears(2 * GiB + 1, 1 * GiB), "the read-ahead must come back above twice the reserve");
+    require(speculative_read_clears(0, 1 * GiB), "an unknown MemFree must let the read-ahead back");
+    // a window's speculative bytes: a quarter of the free pages above the reserve, never more than the caller's budget
+    require(speculative_window_bytes(0, 1 * GiB, 64 << 20) == 64 << 20, "an unknown MemFree must leave the budget alone");
+    require(speculative_window_bytes(1 * GiB, 1 * GiB, 64 << 20) == 0, "a budget at the reserve must be nothing");
+    require(speculative_window_bytes(1 * GiB + 4 * GiB, 1 * GiB, 8 * GiB) == 1 * GiB,
+            "a window must take a quarter of the free pages above the reserve");
+    require(speculative_window_bytes(1 * GiB + 4 * GiB, 1 * GiB, 32 << 20) == 32 << 20,
+            "a window must not raise the caller's budget");
+    // the start's warning: only when the mapped experts are more than 60% of the RAM
+    require(mapped_memory_warning(30 * GiB, 64 * GiB).empty(), "a pack that fits the page cache was warned about");
+    require(mapped_memory_warning(40 * GiB, 0).empty(), "an unknown RAM was warned about");
+    const std::string warn = mapped_memory_warning(50 * GiB, 64 * GiB);
+    require(warn.find("78%") != std::string::npos && warn.find("STRATA_IO_PF_RESERVE_GIB") != std::string::npos,
+            "the mapped-memory warning is incomplete");
+}
+
 // #1250: when the page-locked complement is registered in steps, and what a meminfo reading says
 void test_pin_pacing() {
     using namespace strata::core::detail;
@@ -695,7 +727,19 @@ void test_io_prefetch() {
     }
     FileExpertSource source;
     require(source.open(dir.path.string(), layers, experts, err), "could not map the synthetic pack: " + err);
+    // the read-ahead keeps 1-4 GiB free by default; a tiny reserve here, so the guard does not turn this test's
+    // predictions off on a build machine whose free pages are low
+#if defined(_WIN32)
+    _putenv_s("STRATA_IO_PF_RESERVE_GIB", "0.001");
+#else
+    setenv("STRATA_IO_PF_RESERVE_GIB", "0.001", 1);
+#endif
     source.set_io_prefetch(true, 3);
+#if defined(_WIN32)
+    _putenv_s("STRATA_IO_PF_RESERVE_GIB", "0");
+#else
+    setenv("STRATA_IO_PF_RESERVE_GIB", "0", 1);
+#endif
 #if defined(__linux__)
     require(source.io_prefetch() && source.warms(), "io prefetch did not turn on");
     // predictions for the next layers, some of them wrong or repeated, while the layers are read
@@ -1173,6 +1217,7 @@ int main(int argc, char** argv) {
         test_resident_exchange();
         test_resident_memory_budget();
         test_pin_pacing();
+        test_stream_memory_guard();
         test_numa_slice_ranges();
         test_cgroup_memory_budget();
         test_host_memory();

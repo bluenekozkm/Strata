@@ -123,6 +123,60 @@ uint64_t meminfo_bytes(const std::string& meminfo_text, const std::string& key) 
     return 0;
 }
 
+uint64_t stream_reserve_bytes(uint64_t total_ram) {
+    // A sixteenth of the RAM, kept between 1 GiB and 4 GiB: 16 GiB -> 1 GiB, 32 GiB -> 2 GiB, 64 GiB -> 4 GiB.  Lower
+    // than the page-cache figures of #1250 (what the driver takes cannot be given back; what the read-ahead takes can),
+    // and far above the kernel's own min watermark (tens of MB), which is no margin at all for the next page fault.
+    if (total_ram == 0) return 1ull << 30;
+    uint64_t r = total_ram / 16;
+    if (r < (1ull << 30)) r = 1ull << 30;
+    if (r > (4ull << 30)) r = 4ull << 30;
+    return r;
+}
+
+bool speculative_read_fits(uint64_t free_now, uint64_t reserve) {
+    return free_now == 0 || free_now > reserve;   // 0: MemFree unknown, read as before
+}
+
+bool speculative_read_clears(uint64_t free_now, uint64_t reserve) {
+    return free_now == 0 || free_now > 2 * reserve;
+}
+
+uint64_t speculative_window_bytes(uint64_t free_now, uint64_t reserve, uint64_t want) {
+    if (free_now == 0) return want;
+    const uint64_t room = free_now > reserve ? free_now - reserve : 0;
+    return std::min(want, room / 4);
+}
+
+std::string mapped_memory_warning(uint64_t mapped, uint64_t total_ram) {
+    if (mapped == 0 || total_ram == 0 || mapped * 10 <= total_ram * 6) return "";
+    char msg[512];
+    std::snprintf(msg, sizeof msg,
+                  "the model files mapped for the experts (%.1f GiB) are %.0f%% of this PC's %.1f GiB of RAM: the page "
+                  "cache cannot hold them, so the file tier streams them and keeps %.1f GiB free "
+                  "(STRATA_IO_PF_RESERVE_GIB); a smaller model, a smaller --max-context or more RAM is the long-term fix",
+                  (double) mapped / 1073741824.0, 100.0 * (double) mapped / (double) total_ram,
+                  (double) total_ram / 1073741824.0, (double) stream_reserve_bytes(total_ram) / 1073741824.0);
+    return msg;
+}
+
+uint64_t system_ram_bytes() {
+#if defined(__linux__)
+    std::ifstream info("/proc/meminfo");
+    if (!info) return 0;
+    std::stringstream text;
+    text << info.rdbuf();
+    return meminfo_bytes(text.str(), "MemTotal");
+#elif defined(_WIN32)
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status) ? (uint64_t) status.ullTotalPhys : 0;
+#else
+    const long pages = sysconf(_SC_PHYS_PAGES), page_bytes = sysconf(_SC_PAGESIZE);
+    return pages > 0 && page_bytes > 0 ? (uint64_t) pages * (uint64_t) page_bytes : 0;
+#endif
+}
+
 uint64_t numa_pin_free(uint64_t global_free, const std::vector<uint64_t>& node_free) {
     if (node_free.size() < 2) return global_free;
     const uint64_t smallest = *std::min_element(node_free.begin(), node_free.end());
@@ -1081,10 +1135,13 @@ FileExpertSource::IoCounters FileExpertSource::io_counters() const {
 // measured they can read in one window (one worker's rate x the workers x the window's time) times STRATA_IO_PF_BUDGET_FRAC;
 // 256 MB until both rates are known.
 uint64_t FileExpertSource::io_budget_now() const {
-    if (io_budget_fixed_ > 0) return io_budget_fixed_;
-    if (io_bw_ <= 0.0 || io_win_us_ <= 0.0) return 256ull << 20;
-    const double b = io_bw_ * (double) std::max(1, io_threads_) * io_win_us_ * io_budget_frac_ * io_scale_;
-    return (uint64_t) std::max(16.0 * 1048576.0, b);
+    const uint64_t want = io_budget_fixed_ > 0 ? io_budget_fixed_
+                       : (io_bw_ <= 0.0 || io_win_us_ <= 0.0) ? 256ull << 20
+                       : (uint64_t) std::max(16.0 * 1048576.0,
+                                             io_bw_ * (double) std::max(1, io_threads_) * io_win_us_ * io_budget_frac_ * io_scale_);
+    // never more than a quarter of the free pages above the reserve in one window (see stream_reserve_bytes); at or
+    // under the reserve the budget is 0, so warm_scored admits nothing
+    return detail::speculative_window_bytes(stream_free_.load(std::memory_order_relaxed), stream_reserve_, want);
 }
 
 void FileExpertSource::io_window_tick() {
@@ -1116,6 +1173,10 @@ void FileExpertSource::io_window_tick() {
 void FileExpertSource::warm_scored(int64_t layer, const int64_t* experts, const float* conf, int64_t n, int ahead) {
     if (!io_sched_ || !io_pf_ || !direct_.empty() || !io_ahead_ || !gate_open()) { warm(layer, experts, n); return; }
     if (n <= 0 || layer < 0 || layer >= n_layers_) return;
+    if (!stream_may_read_ahead()) {   // the free pages are at the reserve: no speculative read at all
+        stream_refusals_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
     const uint64_t deadline = io_epoch_.load(std::memory_order_relaxed) + (uint64_t) std::max(1, ahead);
     bool any = false;
@@ -1188,6 +1249,15 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
         if (const char* m = std::getenv("STRATA_IO_PF_GATE_LO")) gate_lo_ = std::clamp(std::atof(m), 0.0, 1.0);
         if (const char* m = std::getenv("STRATA_IO_PF_GATE_HI")) gate_hi_ = std::clamp(std::atof(m), gate_lo_, 1.0);
         if (const char* m = std::getenv("STRATA_IO_PF_GATE_USEFUL")) gate_min_useful_ = std::clamp(std::atof(m), 0.0, 1.0);
+    }
+    {   // the free pages the file tier keeps for the kernel, and the MemFree the read-ahead starts from
+        stream_init();
+        stream_update_free();
+        std::fprintf(stderr, "FileExpertSource: file tier: keeps %.2f GiB of the RAM free (STRATA_IO_PF_RESERVE_GIB); "
+                             "%.2f GiB free now, %s\n",
+                     (double) stream_reserve_ / 1073741824.0, (double) stream_free() / 1073741824.0,
+                     detail::speculative_read_fits(stream_free(), stream_reserve_) ? "read-ahead may run"
+                                                                                  : "read-ahead held back");
     }
     if (!pf_mark_) {
         pf_mark_.reset(new std::atomic<uint8_t>[(size_t) (n_layers_ * n_expert_)]);
@@ -1275,6 +1345,10 @@ void FileExpertSource::io_worker() {
                 ahead = (io_q_.back().second & kIoAhead) != 0;
                 io_q_.pop_back();
             }
+        }
+        if (ahead && !stream_may_read_ahead()) {   // queued as a prediction, but the free pages went away meanwhile
+            stream_refusals_.fetch_add(1, std::memory_order_relaxed);
+            continue;
         }
         io_pf_jobs_.fetch_add(1, std::memory_order_relaxed);
         const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
@@ -2042,7 +2116,88 @@ void FileExpertSource::gate_capacity() {
         if (want) gate_useless_ = false;
     }
     if (!room_ok) gate_useless_ = false;
+    // the share above is MemAvailable, which counts the clean file cache the engine's own streaming fills, so it can stay
+    // high while the pages really free run out and the kernel's reclaim has stopped; the next read-ahead burst is then the
+    // allocation that OOM-kills the engine.  The free pages therefore close the gate regardless of the share: at or under
+    // the reserve it closes, and it opens again only once twice the reserve is free (hysteresis; below that the state
+    // stays).  On a box with room the free pages never come near the reserve, so the share keeps its role.
+    const uint64_t free_now = stream_free_.load(std::memory_order_relaxed);
+    if (!detail::speculative_read_fits(free_now, stream_reserve_) ||
+        !detail::speculative_read_clears(free_now, stream_reserve_))
+        want = false;
+    if (want && std::chrono::steady_clock::now() < gate_hold_until_) want = false;
     if (want != open) { gate_open_.store(want, std::memory_order_relaxed); ++gate_flips_; }
+}
+
+// ---- the file tier's own memory guard
+//
+// `mmap` maps the expert file; it does not reserve RAM.  Every page the engine faults in (or reads ahead) is a real page
+// in the page cache, in this process's file-rss, and part of its OOM score.  The kernel can give clean pages back, but
+// while the engine streams experts at decode speed the pages it just touched are young again at once, so reclaim cannot
+// keep up: with the free pages at the min watermark and `all_unreclaimable`, one more fault or read-ahead burst of the
+// engine is the allocation that ends it.  Three things follow, all of them cheap:
+//   - the read-ahead and the madvise hints only run while MemFree is above the reserve (stream_reserve_bytes);
+//   - one decode window's speculative bytes stay under a quarter of the free pages above that reserve;
+//   - if the free pages still fall to half the reserve (another program grew, a burst of readahead already in flight),
+//     the mapped experts' clean pages are handed back to the page cache, which is the state the kernel was asking for.
+void FileExpertSource::stream_init() {
+    std::call_once(stream_once_, [this] {
+        stream_reserve_ = detail::stream_reserve_bytes(detail::system_ram_bytes());
+        if (const char* v = std::getenv("STRATA_IO_PF_RESERVE_GIB"); v != nullptr && std::atof(v) > 0.0)
+            stream_reserve_ = (uint64_t) (std::atof(v) * 1073741824.0);
+    });
+}
+
+void FileExpertSource::stream_update_free() {
+    stream_init();
+    // the reading costs a few /proc opens: once per 50 ms is enough, the window tick calls this per layer change
+    const auto now = std::chrono::steady_clock::now();
+    if (stream_free_at_.time_since_epoch().count() != 0 && now - stream_free_at_ < std::chrono::milliseconds(50)) return;
+    stream_free_at_ = now;
+    uint64_t free_now = 0;
+    if (free_memory_bytes(free_now)) stream_free_.store(free_now, std::memory_order_relaxed);
+}
+
+bool FileExpertSource::stream_may_read_ahead() {
+    stream_init();
+    return detail::speculative_read_fits(stream_free_.load(std::memory_order_relaxed), stream_reserve_);
+}
+
+void FileExpertSource::stream_relieve() {
+#if defined(__linux__)
+    if (stream_reserve_ == 0) return;   // nothing read ahead here: nothing to give back
+    const uint64_t seen = stream_free_.load(std::memory_order_relaxed);
+    if (seen != 0 && seen > stream_reserve_) return;   // well above the brink: no extra reading of /proc
+    uint64_t free_now = 0;              // fresh, not the window's reading: this is the last check before the OOM killer
+    if (!free_memory_bytes(free_now)) return;
+    stream_free_.store(free_now, std::memory_order_relaxed);
+    if (free_now > stream_reserve_ / 2) return;   // not at the brink
+    const auto now = std::chrono::steady_clock::now();
+    if (stream_reliefs_ > 0 && now - stream_relief_at_ < std::chrono::seconds(10)) return;
+    stream_relief_at_ = now;
+    ++stream_reliefs_;
+    gate_hold_until_ = now + std::chrono::seconds(15);   // the free pages get the room back before any read-ahead
+    uint64_t released = 0;
+    int files = 0;
+    auto drop = [&](const uint8_t* at, uint64_t len, int fd) {
+        if (at == nullptr || len == 0) return;
+        if (::madvise((void*) at, (size_t) len, MADV_DONTNEED) != 0) return;   // the PTEs go first: mapped pages are not
+        ++files;                                                             // dropped by POSIX_FADV_DONTNEED alone
+        released += len;
+        if (fd >= 0) (void) ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    };
+    if (!maps_.empty()) {
+        for (const Map& m : maps_)
+            if (!m.closed) drop(m.base, m.bytes, m.fd);
+    } else if (!unmapped_) {
+        drop(base_, mapped_bytes_, fd_);
+    }
+    std::fprintf(stderr, "FileExpertSource: low on free RAM (%.2f GiB, the file tier's reserve is %.2f GiB): released the "
+                         "mapped experts' clean pages (%d file(s), up to %.2f GiB) and paused the read-ahead for 15 s; the "
+                         "experts are read from storage again from here on (STRATA_IO_PF_RESERVE_GIB sizes the reserve)\n",
+                 (double) free_now / 1073741824.0, (double) stream_reserve_ / 1073741824.0, files,
+                 (double) released / 1073741824.0);
+#endif
 }
 
 // Fills buffer `v` (reserved by claim_stage) outside the lock, then publishes it.
@@ -3005,6 +3160,10 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
 
 void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
     if ((role_ptr_.empty() && !io_pf_) || n <= 0 || layer < 0 || layer >= n_layers_) return;
+    // these are predictions - the page cache can do without them.  Under the reserve the demand reads are all the engine
+    // does (read_ahead_enabled()/gate_open() are separate switches for the same reads).
+    const bool may_read_ahead = stream_may_read_ahead();
+    if (!may_read_ahead) stream_refusals_.fetch_add(1, std::memory_order_relaxed);
     uint32_t stamp;
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
@@ -3023,6 +3182,7 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
             continue;                                                    // in the RAM copy
         if (warm_stamp_) warm_stamp_[index].store(stamp, std::memory_order_relaxed);
         warm_count_.fetch_add(1, std::memory_order_relaxed);
+        if (!may_read_ahead) continue;   // the free pages are at the reserve: no pread, no madvise
         if (io_pf_ && direct_.empty() && gate_open()) {   // read it ahead with pread on the I/O threads (instead of an madvise hint)
             if (io_ahead_) io_enqueue(layer, e, true);
             continue;
@@ -3337,8 +3497,12 @@ void FileExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k)
             io_epoch_.store(epoch_, std::memory_order_relaxed);   // 149-prefetch: the workers' deadline clock
         }
     }
+    if (new_window) stream_update_free();   // the MemFree this window's read-ahead is judged by
     if (new_window && io_sched_) io_window_tick();
-    if (new_window && gate_on_ && tl_decode) { gate_capacity(); gate_tick(); }
+    if (new_window && tl_decode) {
+        stream_relieve();                   // the free pages are at the brink: hand the mapped experts' pages back
+        if (gate_on_) { gate_capacity(); gate_tick(); }
+    }
 }
 
 bool FileExpertSource::transient(int64_t layer, int64_t expert) const {

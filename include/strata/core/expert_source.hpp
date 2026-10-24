@@ -109,6 +109,26 @@ bool pin_step_fits(uint64_t available, uint64_t step, uint64_t reserve);
 /// Parses `key` ("MemFree") of a /proc/meminfo text; 0 when absent.
 uint64_t meminfo_bytes(const std::string& meminfo_text, const std::string& key);
 
+/// The free pages the file tier keeps for the kernel and the other programs while it streams experts - a sixteenth of the
+/// host's RAM, between 1 GiB and 4 GiB; `total_ram` 0 (unknown) gives 1 GiB.  `mmap` reserves nothing, so every page the
+/// engine faults in or reads ahead is a real page in the page cache and part of its OOM score; once MemAvailable counts
+/// mostly that cache, the kernel's reclaim cannot keep up with the engine's own streaming and one more fault or
+/// read-ahead burst is the allocation the OOM killer takes.  Speculation stops at this reserve, not at the kernel's low
+/// watermark (tens of MB), which leaves a page fault no margin at all.
+uint64_t stream_reserve_bytes(uint64_t total_ram);
+/// Whether the file tier may read ahead now (MemFree `free_now`, 0 when unknown): above `reserve`.
+bool speculative_read_fits(uint64_t free_now, uint64_t reserve);
+/// Whether the read-ahead may come back after a close: the free pages have recovered to twice the reserve (hysteresis).
+bool speculative_read_clears(uint64_t free_now, uint64_t reserve);
+/// The speculative bytes one decode window may take: `want`, capped to a quarter of the free pages above `reserve`
+/// (0 when they are at or under it).
+uint64_t speculative_window_bytes(uint64_t free_now, uint64_t reserve, uint64_t want);
+/// One line for the start when the model files this source maps exceed 60% of the host's RAM - the page cache cannot hold
+/// them, so the file tier streams and keeps its reserve - else "".  `total_ram` 0: nothing to say.
+std::string mapped_memory_warning(uint64_t mapped, uint64_t total_ram);
+/// The host's RAM (Linux MemTotal, Windows total physical memory); 0 when it cannot be read.
+uint64_t system_ram_bytes();
+
 /// 0.1.42 (NUMA report): the MemFree to judge the page-locked complement by.  `global_free` is the whole host's MemFree;
 /// `node_free` each NUMA node's own (/sys/devices/system/node/node*/meminfo, empty or one entry on a single-node host).
 /// A dual-socket host whose second node is full of another model's file cache has plenty free in total but none where
@@ -1023,7 +1043,10 @@ public:
     /// file-tier bytes cached now) / the experts' bytes, checked every 16 decode windows; it closes below
     /// STRATA_IO_PF_GATE_LO 0.55 and opens above STRATA_IO_PF_GATE_HI 0.65.  Closed, the decode reads as without io
     /// prefetch; the prompt path is not gated.  (A held share at demand would not do: the read-ahead itself raises it.)
-    /// `DecodeScope` marks the decode thread (and the fetch threads it starts).
+    /// That share alone can stay high while the pages really free run out (MemAvailable counts the clean cache the
+    /// kernel could not reclaim in time), so the gate also closes while MemFree is at or under the reserve
+    /// (stream_reserve_bytes) and only opens again at twice the reserve.  `DecodeScope` marks the decode thread (and the
+    /// fetch threads it starts).
     double gate_ratio() const { return gate_ratio_; }
     struct DecodeScope {
         bool prev;
@@ -1054,7 +1077,29 @@ public:
     double gate_held() const { return gate_ewma_; }
     int64_t gate_closed_windows() const { return gate_closed_w_; }
     int64_t gate_flips() const { return gate_flips_; }
+    /// The free RAM the file tier leaves for the kernel while it reads (`STRATA_IO_PF_RESERVE_GIB` overrides), the
+    /// MemFree the last decode window saw (0: unknown), and how many speculative reads that reserve refused since the
+    /// start.
+    uint64_t stream_reserve() const { return stream_reserve_; }
+    uint64_t stream_free() const { return stream_free_.load(std::memory_order_relaxed); }
+    int64_t stream_refusals() const { return stream_refusals_.load(std::memory_order_relaxed); }
+    /// The bytes of the expert files this source maps: a pack's `experts.bin` mapping, or the GGUF in place's blobs.
+    uint64_t mapped_bytes() const { return mapped_bytes_ != 0 ? mapped_bytes_ : expert_bytes(); }
 private:
+    void stream_init();           ///< the reserve (once): stream_reserve_bytes of the host's RAM, the env override
+    void stream_update_free();    ///< the MemFree the next window judges the read-ahead by
+    bool stream_may_read_ahead(); ///< may the file tier read ahead now (stream_init on first use)
+    /// The free pages are at the brink (under half the reserve): hand the mapped experts' clean pages back, at most once
+    /// per 10 s, and keep the read-ahead off for a while after.  The last resort before the kernel's OOM killer.
+    void stream_relieve();
+    uint64_t stream_reserve_ = 0;
+    std::once_flag stream_once_;   ///< the reserve is computed once, whichever thread reads free memory first
+    std::atomic<uint64_t> stream_free_{0};
+    std::chrono::steady_clock::time_point stream_free_at_{};   ///< when stream_free_ was last read (throttles the read)
+    std::atomic<int64_t> stream_refusals_{0};
+    int64_t stream_reliefs_ = 0;
+    std::chrono::steady_clock::time_point stream_relief_at_{};
+    std::chrono::steady_clock::time_point gate_hold_until_{};   ///< no read-ahead until then (after a relief)
     void gate_tick();
     void gate_capacity();
     bool gate_on_ = false;

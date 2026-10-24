@@ -282,7 +282,12 @@ decode's read-ahead is judged - it runs only while the page cache has room for t
 tightest cgroup limit included, over the experts' bytes: off below 0.55, on above 0.65, `STRATA_IO_PF_GATE_LO` / `_HI`) and
 while it pays (at least 128 MB read ahead in 16 windows and 10% of it used, `STRATA_IO_PF_GATE_USEFUL`; a probe every 256
 windows when it closed for that). Closed, the decode reads as it did without io prefetch (the look-ahead predicts one layer
-and warms with an madvise hint); the prompt path keeps its preads either way. Measured on an RTX PRO 5000 emulating a 12 GB
+and warms with an madvise hint); the prompt path keeps its preads either way. The gate also closes while the free pages
+(`MemFree`) are at or under the file tier's reserve - a sixteenth of the RAM, between 1 and 4 GiB,
+`STRATA_IO_PF_RESERVE_GIB` - and opens again only above twice the reserve; a window's speculative bytes stay under a
+quarter of the free pages above it. `MemAvailable` counts the clean cache the engine's own streaming fills, so a share
+test alone can stay open while the kernel has no page left to give; `mmap` reserves nothing, and every page the engine
+reads is its file-rss and part of its OOM score. Measured on an RTX PRO 5000 emulating a 12 GB
 card (`--expert-cache 4448`, Q2_0 GGUF in place, page cache dropped before each engine, RAM limited by a cgroup), the 0.2.0
 defaults against the 0.1.4x ones, 3 interleaved pairs, story / code / doc8k decode and 4K / 20K prompts: 32 GB of RAM
 1.70 / 2.56 / 2.88x decode (34.0 / 28.0 / 21.7 -> 57.6 / 71.7 / 62.6 tok/s), 1.54 / 1.91x prompts; 16 GB 1.16 / 1.25 / 1.25x
@@ -302,7 +307,11 @@ page faults. With this on, the layer's uncached experts and the router-predicted
 `STRATA_IO_PREFETCH_DEPTH`, default 2 when on) are read by I/O threads (`STRATA_IO_PF_THREADS`, default 8) with whole-blob
 `pread`s into the page cache, and the CPU kernels read the mapping as before. The bytes are the same, so the output is the
 same (greedy IQ3_XXS and Q2_0 hashes identical, prefetch off vs on). `STRATA_IO_PF_STAGE=1` instead stages every uncached
-expert in a buffer and makes the layer wait for them; `STRATA_IO_PF_AHEAD=0` keeps only the demand reads. The per-request
+expert in a buffer and makes the layer wait for them; `STRATA_IO_PF_AHEAD=0` keeps only the demand reads. With the read-ahead
+off (its gate, or the reserve above), the free pages are still watched: when they fall to half the reserve, the mapped
+experts' clean pages are handed back to the page cache (`madvise(MADV_DONTNEED)` + `POSIX_FADV_DONTNEED`) at most once per
+10 s and the read-ahead stays paused for 15 s, which costs a re-read from storage but leaves the kernel a page to give. The
+start also prints a warning when the mapped model files are more than 60% of the RAM. The per-request
 log line "file tier I/O" shows what the OS read from the drive (/proc/self/io, major faults) against the engine's expert
 reads; `STRATA_IO_STATS=1` (or prefetch on) adds the page-cache hit / miss split (mincore) and the read-ahead used / unused counts.
 Measured (interleaved A/B, 10 pairs, 200-token greedy medians, page cache dropped before each run, memory limit by cgroup):

@@ -5633,6 +5633,13 @@ int main(int argc, char** argv) {
                                      "(%s)\n", why.c_str());
         }
 #endif
+        // say it once at start when the mapped model files cannot fit in the page cache: `mmap` reserves nothing, the
+        // pages read are file-rss and part of the OOM score, and the engine's own read-ahead then faults the allocation
+        // that kills it.  The file tier keeps a reserve free from here on.
+        if (const std::string oom_note = strata::core::detail::mapped_memory_warning(
+                src.mapped_bytes(), strata::core::detail::system_ram_bytes());
+            !oom_note.empty())
+            std::fprintf(stderr, "strata generate: WARNING: %s\n", oom_note.c_str());
         // Linux I/O path: whole-blob preads instead of page faults, and the predicted experts of the next layers read
         // ahead on I/O threads while the current layer computes (see FileExpertSource::set_io_prefetch).  0.2.0: on by
         // default on Linux, with the decode gate (STRATA_IO_PF_GATE) and zero-copy page-cached experts
@@ -15517,10 +15524,12 @@ int main(int argc, char** argv) {
                                      (unsigned long long) (ic.crit_n - ic_prev.crit_n));
                     if (src.io_prefetch() && src.gate_on())   // 149 STRATA_IO_PF_GATE: the decode's held share, the gate
                         std::fprintf(stderr, "; decode gate: cache room %.2f of the experts, read-ahead used %.0f%%, page cache "
-                                             "held %.0f%% of the decode's reads (EWMA), %s, closed in %lld windows so far, %lld flips",
+                                             "held %.0f%% of the decode's reads (EWMA), %s, closed in %lld windows so far, %lld flips, "
+                                             "free RAM %.2f GiB (reserve %.2f GiB), %lld read-ahead refusals",
                                      src.gate_ratio(), 100.0 * src.gate_useful(), 100.0 * std::max(0.0, src.gate_held()),
                                      src.gate_open() ? "open" : "closed", (long long) src.gate_closed_windows(),
-                                     (long long) src.gate_flips());
+                                     (long long) src.gate_flips(), (double) src.stream_free() / 1073741824.0,
+                                     (double) src.stream_reserve() / 1073741824.0, (long long) src.stream_refusals());
                     if (src.io_prefetch())   // 149-prefetch: bytes read ahead, of them used before their demand; the scheduler's drops
                         std::fprintf(stderr, "; read ahead %.1f MB, %.1f MB of it used; %llu late, %llu not admitted (confidence), "
                                              "%llu (budget %.0f MB/window)",

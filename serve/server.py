@@ -104,6 +104,48 @@ def popen(what: str, args: list, role: str = "engine", **kw):
 ENGINE_QUIT_WAIT_S, ENGINE_TERM_WAIT_S, ENGINE_KILL_WAIT_S = 20, 5, 20
 
 
+def oom_score_adj(pid: int) -> int | None:
+    """Linux only: a process's /proc/<pid>/oom_score_adj, or None where it cannot be read (other platforms, no such
+    process). A positive figure makes the kernel pick that process first when RAM runs out; a desktop session or an
+    agent can pass one down to everything it starts."""
+    try:
+        with open(f"/proc/{pid}/oom_score_adj", encoding="ascii") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def set_oom_score_adj(pid: int, value: int) -> str:
+    """Linux only: ask the kernel for `value` for `pid`. Raising the figure is always allowed; lowering it below the
+    inherited one needs CAP_SYS_RESOURCE (so a normal user's engine keeps what the session gave it). Returns "" when
+    the write worked, else the reason in words."""
+    try:
+        with open(f"/proc/{pid}/oom_score_adj", "w", encoding="ascii") as f:
+            f.write(str(int(value)))
+        return ""
+    except OSError as e:
+        return f"{type(e).__name__}: {e.strerror or e}"
+
+
+_OOM_ADVICE_SHOWN = False
+
+
+def oom_advice(pid: int) -> str:
+    """Linux only: one sentence when the engine's oom_score_adj makes it the kernel's first pick, else "". Printed once
+    per server run: the engine maps the experts, so its file-rss - not a leak - is what the kernel scores."""
+    global _OOM_ADVICE_SHOWN
+    if _OOM_ADVICE_SHOWN:
+        return ""
+    adj = oom_score_adj(pid)
+    if adj is None or adj < 100:
+        return ""
+    _OOM_ADVICE_SHOWN = True
+    return (f"The engine inherited oom_score_adj {adj}: when this PC runs out of RAM the kernel ends the engine first, "
+            "and its mapped expert files count as its memory. Start the server under a decreasing setting, for example "
+            "`systemd-run --user --scope -p OOMScoreAdjust=-500 -- strata serve ...`, or give it CAP_SYS_RESOURCE with "
+            "STRATA_OOM_SCORE_ADJ=0.")
+
+
 def rttime_limit_note() -> str:
     """#3238: Linux only. A hard RLIMIT_RTTIME that is not unlimited (PipeWire's client module sets it to 0 when rtkit is
     missing; every program started from that desktop inherits it) makes the kernel SIGKILL a process as soon as it
@@ -1028,6 +1070,19 @@ class StrataEngine:
             if log:
                 self.log.close()
             raise
+        # Linux: the kernel's OOM score of the engine, and what can be asked of it (the engine maps the experts, so its
+        # file-rss is what the kernel scores; a leaked RAM figure it is not).
+        want_adj = os.environ.get("STRATA_OOM_SCORE_ADJ", "").strip()
+        if want_adj:
+            try:
+                why = set_oom_score_adj(self.proc.pid, int(want_adj))
+            except ValueError:
+                why = f"STRATA_OOM_SCORE_ADJ is not a number: {want_adj!r}"
+            if why:
+                print(f"[strata] the engine keeps oom_score_adj {oom_score_adj(self.proc.pid)}: {why}", flush=True)
+        note = oom_advice(self.proc.pid)
+        if note:
+            print("[strata] " + note, flush=True)
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
         ready_q: queue.Queue = queue.Queue()
@@ -1234,8 +1289,10 @@ class StrataEngine:
                     "process|out of memory') shows an out-of-memory kill instead, close other programs or use a smaller "
                     "model (Q2_0 / IQ2_XS).")
         return ("The usual cause is running out of RAM: Linux then ends the biggest program (check: sudo dmesg | "
-                "grep -i -E 'killed process|out of memory'); Windows slows down instead. Close other programs or use a "
-                "smaller model (Q2_0 / IQ2_XS).")
+                "grep -i -E 'killed process|out of memory'); Windows slows down instead. The mapped expert files count as "
+                "the engine's memory on Linux, and the file tier keeps a reserve free (STRATA_IO_PF_RESERVE_GIB, a "
+                "sixteenth of the RAM by default); with little RAM left, close other programs, lower --max-context, or "
+                "use a smaller model (Q2_0 / IQ2_XS).")
 
     def alive(self) -> bool:
         proc = self.proc                                 # read once: restart() / close() may set it to None meanwhile
