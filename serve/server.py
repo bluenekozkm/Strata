@@ -3057,15 +3057,23 @@ def engine_args(cfg: dict) -> list[str]:
         seg = cfg.get("vram_segment_mib")
         if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
             args += ["--vram-segment-mib", str(seg)]
-    # Tiered KV cache (Cluster 5)
-    if cfg.get("kv_disk_cache") and "--kv-disk-cache" not in args:
-        args += ["--kv-disk-cache", str(cfg["kv_disk_cache"])]
-    if cfg.get("kv_disk_budget") is not None and "--kv-disk-budget" not in args:
-        args += ["--kv-disk-budget", str(cfg["kv_disk_budget"])]
-    elif cfg.get("kv_disk_budget_mib") is not None and "--kv-disk-budget" not in args:
-        args += ["--kv-disk-budget", str(cfg["kv_disk_budget_mib"])]
-    if cfg.get("kv_multi_system_prompt") is True and "--kv-multi-system-prompt" not in args:
-        args.append("--kv-multi-system-prompt")
+    # Tiered KV cache (Cluster 5 / Experimental)
+    exp_tkv = cfg.get("exp_tiered_kv")
+    disk_dir = cfg.get("kv_disk_cache")
+    if exp_tkv or disk_dir:
+        if "--exp-tiered-kv" not in args and "--exp-tiered-kv-cache" not in args:
+            if isinstance(exp_tkv, str) and exp_tkv.strip():
+                args += ["--exp-tiered-kv", exp_tkv.strip()]
+            elif disk_dir:
+                args += ["--exp-tiered-kv", str(disk_dir).strip()]
+            else:
+                args.append("--exp-tiered-kv")
+        if cfg.get("kv_disk_budget") is not None and "--kv-disk-budget" not in args:
+            args += ["--kv-disk-budget", str(cfg["kv_disk_budget"])]
+        elif cfg.get("kv_disk_budget_mib") is not None and "--kv-disk-budget" not in args:
+            args += ["--kv-disk-budget", str(cfg["kv_disk_budget_mib"])]
+        if cfg.get("kv_multi_system_prompt") is True and "--kv-multi-system-prompt" not in args:
+            args.append("--kv-multi-system-prompt")
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
     return learned_profile_args(cfg, args)
@@ -3785,7 +3793,7 @@ def extract_system_prompts(req: dict | None, messages: list[dict] | None = None)
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = True):
+                 fit_max_tokens: bool = True, exp_tiered_kv: bool | str = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
@@ -3808,6 +3816,8 @@ class Service:
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
+        self.exp_tiered_kv = bool(exp_tiered_kv)
+        self.exp_tiered_kv_dir = exp_tiered_kv if isinstance(exp_tiered_kv, str) else None
         self.system_prompt_branches: dict[str, int] = {}
         self.last_system_prompt_hash: str | None = None
         self.tiered_kv_lock = threading.Lock()
@@ -4592,15 +4602,19 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
-        with self.tiered_kv_lock:
-            tkv_metrics = dict(self.tiered_kv_metrics)
-            tkv_metrics["system_prompt_branches"] = len(self.system_prompt_branches)
-        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
-                "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
-                "tiered_kv": tkv_metrics,
-                "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
-                "hardware_static":
-                tel["static"], "history": tel["history"], "time": now}
+        tkv_metrics = None
+        if self.exp_tiered_kv:
+            with self.tiered_kv_lock:
+                tkv_metrics = dict(self.tiered_kv_metrics)
+                tkv_metrics["system_prompt_branches"] = len(self.system_prompt_branches)
+        res = {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+               "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+               "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
+               "hardware_static":
+               tel["static"], "history": tel["history"], "time": now}
+        if tkv_metrics is not None:
+            res["tiered_kv"] = tkv_metrics
+        return res
 
     def prometheus(self) -> str:
         """GET /metrics/prometheus: the totals and what is running in Prometheus' text format, under llama-server's
@@ -4777,35 +4791,38 @@ class Service:
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
         # Tiered KV cache (Cluster 5): recognize multiple or alternating system prompts
-        sys_prompts = extract_system_prompts(req, messages)
-        meta = None
-        if sys_prompts:
-            sys_combined = "\n---\n".join(sys_prompts)
-            sys_hash = hashlib.sha256(sys_combined.encode("utf-8")).hexdigest()[:16]
-            with self.tiered_kv_lock:
-                if len(sys_prompts) > 1:
-                    self.tiered_kv_metrics["multi_system_requests"] += 1
-                is_switch = False
-                if self.last_system_prompt_hash is not None:
-                    if self.last_system_prompt_hash != sys_hash:
-                        self.tiered_kv_metrics["system_prompt_switches"] += 1
-                        is_switch = True
-                    else:
-                        self.tiered_kv_metrics["system_prompt_hits"] += 1
-                self.last_system_prompt_hash = sys_hash
-                if sys_hash not in self.system_prompt_branches:
-                    self.system_prompt_branches[sys_hash] = len(self.system_prompt_branches)
-                branch_id = self.system_prompt_branches[sys_hash]
-            meta = {
-                "system_prompt_hash": sys_hash,
-                "branch_id": branch_id,
-                "num_system_prompts": len(sys_prompts),
-                "is_multi_system": len(sys_prompts) > 1,
-                "is_switch": is_switch,
-            }
-            if req is not None and isinstance(req, dict) and "tiered_kv" in req:
-                req["tiered_kv"].update(meta)
-        self.last_tiered_kv = meta
+        if self.exp_tiered_kv:
+            sys_prompts = extract_system_prompts(req, messages)
+            meta = None
+            if sys_prompts:
+                sys_combined = "\n---\n".join(sys_prompts)
+                sys_hash = hashlib.sha256(sys_combined.encode("utf-8")).hexdigest()[:16]
+                with self.tiered_kv_lock:
+                    if len(sys_prompts) > 1:
+                        self.tiered_kv_metrics["multi_system_requests"] += 1
+                    is_switch = False
+                    if self.last_system_prompt_hash is not None:
+                        if self.last_system_prompt_hash != sys_hash:
+                            self.tiered_kv_metrics["system_prompt_switches"] += 1
+                            is_switch = True
+                        else:
+                            self.tiered_kv_metrics["system_prompt_hits"] += 1
+                    self.last_system_prompt_hash = sys_hash
+                    if sys_hash not in self.system_prompt_branches:
+                        self.system_prompt_branches[sys_hash] = len(self.system_prompt_branches)
+                    branch_id = self.system_prompt_branches[sys_hash]
+                meta = {
+                    "system_prompt_hash": sys_hash,
+                    "branch_id": branch_id,
+                    "num_system_prompts": len(sys_prompts),
+                    "is_multi_system": len(sys_prompts) > 1,
+                    "is_switch": is_switch,
+                }
+                if req is not None and isinstance(req, dict) and "tiered_kv" in req:
+                    req["tiered_kv"].update(meta)
+            self.last_tiered_kv = meta
+        else:
+            self.last_tiered_kv = None
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
@@ -5049,7 +5066,7 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
-        if "tiered_kv" not in (sampling or {}) and self.last_tiered_kv is not None:
+        if self.exp_tiered_kv and "tiered_kv" not in (sampling or {}) and self.last_tiered_kv is not None:
             sampling = {**(sampling or {}), "tiered_kv": self.last_tiered_kv}
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
@@ -8125,6 +8142,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                     help="data-parallel replicas (opt-in): cut the \"gpu\" list into N equal groups and run one engine on "
                          "each, requests spread over them (also \"replicas\" in the config: a number, or "
                          "[{\"gpus\": [0, 1]}, {\"gpus\": [2, 3]}])")
+    ap.add_argument("--exp-tiered-kv", nargs="?", const=True, default=None, metavar="DIR",
+                    help="EXPERIMENTAL: enable Tiered KV Cache. If DIR is provided, persists blocks to SSD; "
+                         "otherwise runs in volatile RAM-only mode (also \"exp_tiered_kv\" in config)")
+    ap.add_argument("--exp-tiered-kv-cache", nargs="?", const=True, default=None, dest="exp_tiered_kv",
+                    help=argparse.SUPPRESS)
     launch_args = list(sys.argv[1:] if argv is None else argv)
     a = ap.parse_args(launch_args)
     if a.engine == "strata" and (_rt := rttime_limit_note()):   # #3238: say it before the first unexplained -9
@@ -8198,6 +8220,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         cfg["replicas"] = a.replicas
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
+    if a.exp_tiered_kv is not None:
+        cfg["exp_tiered_kv"] = a.exp_tiered_kv
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
     supplied_args = argv if argv is not None else sys.argv[1:]
     if ("STRATA_API_KEY" in os.environ and not os.environ["STRATA_API_KEY"].strip()) or \
@@ -8337,10 +8361,35 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             delay_s=getattr(a, "script_delay", 0.0) or 0.0), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
+    exp_tkv_val = a.exp_tiered_kv if a.exp_tiered_kv is not None else cfg.get("exp_tiered_kv")
+    if not exp_tkv_val:
+        args_list = cfg.get("args", [])
+        if "--exp-tiered-kv" in args_list:
+            idx = args_list.index("--exp-tiered-kv")
+            if idx + 1 < len(args_list) and not args_list[idx + 1].startswith("-"):
+                exp_tkv_val = args_list[idx + 1]
+            else:
+                exp_tkv_val = True
+        elif "--exp-tiered-kv-cache" in args_list:
+            idx = args_list.index("--exp-tiered-kv-cache")
+            if idx + 1 < len(args_list) and not args_list[idx + 1].startswith("-"):
+                exp_tkv_val = args_list[idx + 1]
+            else:
+                exp_tkv_val = True
+        elif cfg.get("kv_disk_cache"):
+            exp_tkv_val = cfg["kv_disk_cache"]
+    exp_tkv_enabled = bool(exp_tkv_val)
+    if exp_tkv_enabled:
+        print("[strata] EXPERIMENTAL: Tiered KV Cache is ENABLED (--exp-tiered-kv)", flush=True)
+        tkv_dir = exp_tkv_val if isinstance(exp_tkv_val, str) else cfg.get("kv_disk_cache")
+        if not tkv_dir:
+            print("[strata] WARNING: Tiered KV Cache running in RAM-only mode (no cache directory specified); "
+                  "cached KV states are volatile and will be lost on engine exit or restart!", flush=True)
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
-                  fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
+                  fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False),
+                  exp_tiered_kv=exp_tkv_val if exp_tkv_enabled else False)
     svc.launch_attestation = launch_attestation
     svc.offline = a.offline
     svc.max_queue = max_queue

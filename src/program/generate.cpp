@@ -502,6 +502,7 @@ struct Options {
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
+    bool exp_tiered_kv = false;        ///< enable experimental tiered KV cache (--exp-tiered-kv)
     std::string kv_disk_cache;         ///< persistent disk KV cache directory (empty = off)
     int64_t kv_disk_budget_mib = 10240; ///< SSD budget in MiB (default 10GB)
     bool kv_multi_system_prompt = false; ///< enable host-side multi-branch radix tree cache
@@ -850,7 +851,9 @@ void usage() {
                  "                       cache holds the rest, giving slots back as the context grows (one GPU, with\n"
                  "                       --expert-profile; STRATA_KV_GROW=1/0 also). Default: the whole --max-context\n"
                  "                       allocated at start\n"
-                 "  --kv-disk-cache DIR  persistent disk KV cache directory (empty = off)\n"
+                 "  --exp-tiered-kv [DIR] experimental persistent tiered KV cache (optional DIR for NVMe SSD,\n"
+                 "                       or RAM-only if omitted)\n"
+                 "  --kv-disk-cache DIR  persistent disk KV cache directory (sets --exp-tiered-kv)\n"
                  "  --kv-disk-budget N   persistent disk KV cache budget in MiB (default 10240)\n"
                  "  --kv-multi-system-prompt enable host-side multi-branch radix tree cache\n"
                  "  --stream-token       enqueue token work on the session stream (experimental)\n"
@@ -2458,7 +2461,21 @@ int main(int argc, char** argv) {
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
         else if (a == "--kv-grow") o.kv_grow = true;
         else if (a == "--no-kv-grow") o.kv_grow = false;
-        else if (a == "--kv-disk-cache") o.kv_disk_cache = next("--kv-disk-cache");
+        else if (a == "--exp-tiered-kv" || a == "--exp-tiered-kv-cache" ||
+                 a.rfind("--exp-tiered-kv=", 0) == 0 || a.rfind("--exp-tiered-kv-cache=", 0) == 0) {
+            o.exp_tiered_kv = true;
+            if (a.rfind("--exp-tiered-kv=", 0) == 0) {
+                o.kv_disk_cache = a.substr(std::string("--exp-tiered-kv=").size());
+            } else if (a.rfind("--exp-tiered-kv-cache=", 0) == 0) {
+                o.kv_disk_cache = a.substr(std::string("--exp-tiered-kv-cache=").size());
+            } else if (i + 1 < argc && argv[i + 1][0] != '-') {
+                o.kv_disk_cache = argv[++i];
+            }
+        }
+        else if (a == "--kv-disk-cache") {
+            o.kv_disk_cache = next("--kv-disk-cache");
+            o.exp_tiered_kv = true;
+        }
         else if (a == "--kv-disk-budget") {
             const char* v = next("--kv-disk-budget");
             char* end = nullptr;
@@ -8302,7 +8319,12 @@ int main(int argc, char** argv) {
         std::shared_ptr<strata::core::RadixConvCache> radix_cache;
         std::shared_ptr<strata::core::ContextSwitcher> context_switcher;
 
-        if (!o.kv_disk_cache.empty() || o.kv_multi_system_prompt) {
+        if (o.exp_tiered_kv) {
+            std::fprintf(stderr, "[strata] EXPERIMENTAL: Tiered KV Cache is ENABLED (--exp-tiered-kv)\n");
+            if (o.conversation_cache_mib == 0) {
+                o.conversation_cache_mib = 4096;
+                if (o.conversation_cache_slots <= 0) o.conversation_cache_slots = 8;
+            }
             if (!o.kv_disk_cache.empty()) {
                 strata::platform::NvmeCacheConfig nvme_cfg;
                 nvme_cfg.cache_dir = o.kv_disk_cache;
@@ -8313,27 +8335,29 @@ int main(int argc, char** argv) {
                 std::signal(SIGTERM, tiered_kv_signal_handler);
                 std::fprintf(stderr, "strata serve: initialized Tiered NvmeCache at '%s' (budget %lld MiB)\n",
                              o.kv_disk_cache.c_str(), (long long) o.kv_disk_budget_mib);
+            } else {
+                std::fprintf(stderr, "[strata] WARNING: Tiered KV Cache running in RAM-only mode (no cache directory specified); "
+                                     "cached KV states are volatile and will be lost on engine exit or restart!\n");
             }
-            if (o.kv_multi_system_prompt || nvme_cache != nullptr) {
-                strata::core::RadixConvCacheConfig radix_cfg;
-                radix_cfg.format = (o.kv == "int8") ? strata::core::kKvInt8
-                                 : (o.kv == "k8v4") ? strata::core::kKvHybrid
-                                 : (o.kv == "q4_0") ? strata::core::kKvQ4
-                                 : strata::core::kKvF16;
-                radix_cfg.num_layers = static_cast<uint32_t>(g.n_layers);
-                radix_cfg.num_heads = static_cast<uint32_t>(g.n_head_kv);
-                radix_cfg.head_dim = static_cast<uint32_t>(g.head_dim);
-                radix_cache = std::make_shared<strata::core::RadixConvCache>(radix_cfg);
 
-                strata::core::ContextSwitcherConfig cs_cfg;
-                cs_cfg.format = radix_cfg.format;
-                cs_cfg.num_layers = radix_cfg.num_layers;
-                cs_cfg.num_heads = radix_cfg.num_heads;
-                cs_cfg.head_dim = radix_cfg.head_dim;
-                cs_cfg.enable_fast_prefill_bypass = true;
-                context_switcher = std::make_shared<strata::core::ContextSwitcher>(radix_cache, nvme_cache, cs_cfg);
-                std::fprintf(stderr, "strata serve: initialized RadixConvCache and ContextSwitcher (fast prefill bypass enabled)\n");
-            }
+            strata::core::RadixConvCacheConfig radix_cfg;
+            radix_cfg.format = (o.kv == "int8") ? strata::core::kKvInt8
+                             : (o.kv == "k8v4") ? strata::core::kKvHybrid
+                             : (o.kv == "q4_0") ? strata::core::kKvQ4
+                             : strata::core::kKvF16;
+            radix_cfg.num_layers = static_cast<uint32_t>(g.n_layers);
+            radix_cfg.num_heads = static_cast<uint32_t>(g.n_head_kv);
+            radix_cfg.head_dim = static_cast<uint32_t>(g.head_dim);
+            radix_cache = std::make_shared<strata::core::RadixConvCache>(radix_cfg);
+
+            strata::core::ContextSwitcherConfig cs_cfg;
+            cs_cfg.format = radix_cfg.format;
+            cs_cfg.num_layers = radix_cfg.num_layers;
+            cs_cfg.num_heads = radix_cfg.num_heads;
+            cs_cfg.head_dim = radix_cfg.head_dim;
+            cs_cfg.enable_fast_prefill_bypass = true;
+            context_switcher = std::make_shared<strata::core::ContextSwitcher>(radix_cache, nvme_cache, cs_cfg);
+            std::fprintf(stderr, "strata serve: initialized RadixConvCache and ContextSwitcher (fast prefill bypass enabled)\n");
         }
 
         strata::prefill::Prefill sp;

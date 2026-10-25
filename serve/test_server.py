@@ -6314,43 +6314,105 @@ class PrepareCancelled(unittest.TestCase):
 class Cluster5TieredKvCache(unittest.TestCase):
     """Cluster 5: CLI, Server API & Lifecycle Integration."""
 
-    def test_cli_arg_generation_tiered_kv(self):
-        # 1. Forwarding --kv-disk-cache, --kv-disk-budget, --kv-multi-system-prompt
+    def test_default_linear_chain_kv_cache(self):
+        # 1. Default engine_args does NOT include --exp-tiered-kv
         base_cfg = {"args": ["--native", "shard1.gguf"]}
-        args = engine_args({
+        args = engine_args(base_cfg)
+        self.assertNotIn("--exp-tiered-kv", args)
+        self.assertNotIn("--exp-tiered-kv-cache", args)
+
+        # 2. Default Service does NOT track or inject tiered_kv metadata (Linear Chain KVCache)
+        tok = ByteTokenizer()
+        engine = RecordingEngine(tok, "response text", max_context=4096)
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.assertFalse(svc.exp_tiered_kv)
+
+        req = {
+            "tiered_kv": {},
+            "messages": [
+                {"role": "system", "content": "You are a linear cache assistant."},
+                {"role": "user", "content": "Hello"}
+            ]
+        }
+        svc.prepare(req["messages"], None, {}, max_new=16, req=req)
+        # tiered_kv dict in req should remain empty, last_tiered_kv is None
+        self.assertEqual(req["tiered_kv"], {})
+        self.assertIsNone(svc.last_tiered_kv)
+
+        # Metrics should not expose tiered_kv
+        m = svc.metrics()
+        self.assertNotIn("tiered_kv", m)
+
+    def test_cli_arg_generation_tiered_kv(self):
+        base_cfg = {"args": ["--native", "shard1.gguf"]}
+
+        # 1. Forwarding --exp-tiered-kv with directory
+        args_with_dir = engine_args({
             **base_cfg,
-            "kv_disk_cache": "/mnt/nvme/strata_cache",
+            "exp_tiered_kv": "/mnt/nvme/strata_cache",
             "kv_disk_budget": 20480,
             "kv_multi_system_prompt": True,
         })
-        self.assertIn("--kv-disk-cache", args)
-        self.assertEqual(args[args.index("--kv-disk-cache") + 1], "/mnt/nvme/strata_cache")
-        self.assertIn("--kv-disk-budget", args)
-        self.assertEqual(args[args.index("--kv-disk-budget") + 1], "20480")
-        self.assertIn("--kv-multi-system-prompt", args)
+        self.assertIn("--exp-tiered-kv", args_with_dir)
+        self.assertEqual(args_with_dir[args_with_dir.index("--exp-tiered-kv") + 1], "/mnt/nvme/strata_cache")
+        self.assertIn("--kv-disk-budget", args_with_dir)
+        self.assertEqual(args_with_dir[args_with_dir.index("--kv-disk-budget") + 1], "20480")
+        self.assertIn("--kv-multi-system-prompt", args_with_dir)
 
-        # Alternative budget key: kv_disk_budget_mib
-        args2 = engine_args({
+        # 2. Forwarding --exp-tiered-kv without directory (RAM-only fallback)
+        args_ram_only = engine_args({
             **base_cfg,
+            "exp_tiered_kv": True,
+        })
+        self.assertIn("--exp-tiered-kv", args_ram_only)
+        # After --exp-tiered-kv, there should not be a directory path or budget
+        idx = args_ram_only.index("--exp-tiered-kv")
+        self.assertTrue(idx == len(args_ram_only) - 1 or args_ram_only[idx + 1].startswith("--"))
+
+        # 3. Compatibility with legacy kv_disk_cache key
+        args_compat = engine_args({
+            **base_cfg,
+            "kv_disk_cache": "/mnt/nvme/strata_cache",
             "kv_disk_budget_mib": 5120,
         })
-        self.assertIn("--kv-disk-budget", args2)
-        self.assertEqual(args2[args2.index("--kv-disk-budget") + 1], "5120")
+        self.assertIn("--exp-tiered-kv", args_compat)
+        self.assertEqual(args_compat[args_compat.index("--exp-tiered-kv") + 1], "/mnt/nvme/strata_cache")
+        self.assertIn("--kv-disk-budget", args_compat)
+        self.assertEqual(args_compat[args_compat.index("--kv-disk-budget") + 1], "5120")
 
-        # Idempotence: does not duplicate if already in args
-        args3 = engine_args({
-            "args": ["--kv-disk-cache", "/custom/path", "--kv-multi-system-prompt"],
-            "kv_disk_cache": "/other/path",
+        # 4. Idempotence: does not duplicate if already in args
+        args_idem = engine_args({
+            "args": ["--exp-tiered-kv", "/custom/path", "--kv-multi-system-prompt"],
+            "exp_tiered_kv": "/other/path",
             "kv_multi_system_prompt": True,
         })
-        self.assertEqual(args3.count("--kv-disk-cache"), 1)
-        self.assertEqual(args3[args3.index("--kv-disk-cache") + 1], "/custom/path")
-        self.assertEqual(args3.count("--kv-multi-system-prompt"), 1)
+        self.assertEqual(args_idem.count("--exp-tiered-kv"), 1)
+        self.assertEqual(args_idem[args_idem.index("--exp-tiered-kv") + 1], "/custom/path")
+        self.assertEqual(args_idem.count("--kv-multi-system-prompt"), 1)
+
+    def test_cli_flags_parsing(self):
+        # Verify CLI flag parsing for --exp-tiered-kv and --exp-tiered-kv-cache
+        import argparse
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--exp-tiered-kv", nargs="?", const=True, default=None, metavar="DIR")
+        ap.add_argument("--exp-tiered-kv-cache", nargs="?", const=True, default=None, dest="exp_tiered_kv")
+
+        parsed_none = ap.parse_args([])
+        self.assertIsNone(parsed_none.exp_tiered_kv)
+
+        parsed_flag_only = ap.parse_args(["--exp-tiered-kv"])
+        self.assertTrue(parsed_flag_only.exp_tiered_kv)
+
+        parsed_with_dir = ap.parse_args(["--exp-tiered-kv", "/var/cache/strata"])
+        self.assertEqual(parsed_with_dir.exp_tiered_kv, "/var/cache/strata")
+
+        parsed_alias = ap.parse_args(["--exp-tiered-kv-cache", "/var/cache/strata"])
+        self.assertEqual(parsed_alias.exp_tiered_kv, "/var/cache/strata")
 
     def test_alternating_system_prompts_and_telemetry(self):
         tok = ByteTokenizer()
         engine = RecordingEngine(tok, "response text", max_context=4096)
-        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), exp_tiered_kv=True)
 
         # Request 1: System Prompt A
         req1 = {
@@ -6479,7 +6541,7 @@ class Cluster5TieredKvCache(unittest.TestCase):
     def test_anthropic_system_prompt_extraction_and_blocks(self):
         tok = ByteTokenizer()
         engine = RecordingEngine(tok, "response", max_context=4096)
-        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), exp_tiered_kv=True)
 
         # Anthropic string system prompt
         req_anthropic_str = {
@@ -6513,7 +6575,7 @@ class Cluster5TieredKvCache(unittest.TestCase):
         import concurrent.futures
         tok = ByteTokenizer()
         engine = RecordingEngine(tok, "response", max_context=4096)
-        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), exp_tiered_kv=True)
 
         def call_prepare(idx):
             req = {

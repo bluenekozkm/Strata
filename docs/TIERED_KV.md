@@ -96,8 +96,10 @@ The Persistent Tiered KV Cache addresses this:
 
 ### 5. Server API & Engine Lifecycle (`src/program/generate.cpp`, `serve/server.py`)
 
+- **Default Behavior**: Defaults to the standard **Linear Chain KVCache**. The Tiered KV Cache is an experimental feature enabled via the `--exp-tiered-kv` flag.
 - **Engine CLI options**:
-  - `--kv-disk-cache DIR`: Enables persistent disk cache at directory `DIR`.
+  - `--exp-tiered-kv [DIR]`: Enables experimental persistent tiered KV cache. If `DIR` is specified, blocks are persisted to SSD via Direct I/O; if omitted, runs in RAM-only mode (Tier 1 Radix tree in host RAM) and logs a warning that cached sessions are volatile and will be lost on engine restart.
+  - `--kv-disk-cache DIR`: Persistent disk KV cache directory (implies `--exp-tiered-kv`).
   - `--kv-disk-budget N`: Maximum disk budget in MiB (default: 10240, 10 GiB).
   - `--kv-multi-system-prompt`: Enables multi-branch radix tree cache in resident `--serve` mode.
 - **Signal handling**: `SIGINT` and `SIGTERM` handlers flush dirty blocks and synchronize manifest index to disk.
@@ -128,13 +130,17 @@ Measured on 12th Gen Intel Core i5-12400F, AMD Radeon RX 9070 XT 16 GB (HIP gfx1
 
 ### 1. Running the Engine Directly
 
-Start resident server with tiered disk cache and multi-system prompt branching:
+Start resident server with tiered disk cache enabled via `--exp-tiered-kv`:
 
 ```bash
+# Persistent SSD mode:
 strata --pack <pack_dir> --native <model.gguf> --serve \
-       --kv-disk-cache /path/to/kv_cache \
-       --kv-disk-budget 20480 \
-       --kv-multi-system-prompt
+       --exp-tiered-kv /path/to/kv_cache \
+       --kv-disk-budget 20480
+
+# Or volatile RAM-only mode (warns that data is lost on shutdown):
+strata --pack <pack_dir> --native <model.gguf> --serve \
+       --exp-tiered-kv
 ```
 
 ### 2. Configuring via `serve/server.py`
@@ -146,17 +152,15 @@ In your server configuration file (e.g. `strata-config.json`):
   "args": [
     "--pack", "/path/to/pack",
     "--native", "/path/to/model.gguf",
-    "--kv-disk-cache", "/var/cache/strata/kv",
-    "--kv-disk-budget", "20480",
-    "--kv-multi-system-prompt"
+    "--exp-tiered-kv", "/var/cache/strata/kv",
+    "--kv-disk-budget", "20480"
   ]
 }
 ```
 
-Start the API server:
-
+Or pass via server CLI directly:
 ```bash
-python3 -m serve.server --config strata-config.json
+python3 -m serve.server --config strata-config.json --exp-tiered-kv /var/cache/strata/kv
 ```
 
 Requests to `/v1/chat/completions` or `/v1/messages` with varying system prompts automatically benefit from
