@@ -762,6 +762,20 @@ void test_io_prefetch() {
 #endif
 #if defined(__linux__)
     require(source.io_prefetch() && source.warms(), "io prefetch did not turn on");
+    // relief pause: stream_may_read_ahead() must return false while relief hold is active,
+    // and warm() must refuse predictions instead of falling through to madvise
+    const bool may_read_before = source.stream_may_read_ahead();
+    const auto now = std::chrono::steady_clock::now();
+    const int64_t future_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        (now + std::chrono::seconds(15)).time_since_epoch()).count();
+    source.set_stream_held_until_ms(future_ms);
+    require(!source.stream_may_read_ahead(), "stream must not read ahead during relief hold");
+    const int64_t refusals_before = source.stream_refusals();
+    const int64_t warm_expert = 0;
+    source.warm(0, &warm_expert, 1);
+    require(source.stream_refusals() == refusals_before + 1, "warm() must refuse speculative read during relief hold");
+    source.set_stream_held_until_ms(0);
+    require(source.stream_may_read_ahead() == may_read_before, "stream read-ahead restored once relief hold expires");
     // predictions for the next layers, some of them wrong or repeated, while the layers are read
     for (int round = 0; round < 20; ++round)
         for (int64_t l = 0; l < layers; ++l) {

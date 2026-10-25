@@ -2133,9 +2133,12 @@ void FileExpertSource::gate_capacity() {
     // twice it the state stays).  Asking the state's own test matters: requiring both `fits` and `clears` would close the
     // gate at 1-2x reserve whatever the state was.  On a box with room the free pages never come near the reserve, so the
     // share keeps its role.
+    stream_init();
     const uint64_t free_now = stream_free_.load(std::memory_order_relaxed);
     if (!detail::speculative_gate_room(open, free_now, stream_reserve_)) want = false;
-    if (want && std::chrono::steady_clock::now() < gate_hold_until_) want = false;
+    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (want && now_ms < stream_held_until_ms_.load(std::memory_order_relaxed)) want = false;
     if (want != open) { gate_open_.store(want, std::memory_order_relaxed); ++gate_flips_; }
 }
 
@@ -2171,6 +2174,9 @@ void FileExpertSource::stream_update_free() {
 
 bool FileExpertSource::stream_may_read_ahead() {
     stream_init();
+    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (now_ms < stream_held_until_ms_.load(std::memory_order_relaxed)) return false;
     return detail::speculative_read_fits(stream_free_.load(std::memory_order_relaxed), stream_reserve_);
 }
 
@@ -2187,7 +2193,9 @@ void FileExpertSource::stream_relieve() {
     if (stream_reliefs_.load(std::memory_order_relaxed) > 0 && now - stream_relief_at_ < std::chrono::seconds(10)) return;
     stream_relief_at_ = now;
     stream_reliefs_.fetch_add(1, std::memory_order_relaxed);
-    gate_hold_until_ = now + std::chrono::seconds(15);   // the free pages get the room back before any read-ahead
+    const int64_t hold_until_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        (now + std::chrono::seconds(15)).time_since_epoch()).count();
+    stream_held_until_ms_.store(hold_until_ms, std::memory_order_relaxed);
     uint64_t released = 0;
     int files = 0;
     auto drop = [&](const uint8_t* at, uint64_t len, int fd) {

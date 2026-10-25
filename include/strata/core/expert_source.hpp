@@ -1088,27 +1088,28 @@ public:
     uint64_t stream_free() const { return stream_free_.load(std::memory_order_relaxed); }
     int64_t stream_refusals() const { return stream_refusals_.load(std::memory_order_relaxed); }
     int64_t stream_reliefs() const { return stream_reliefs_.load(std::memory_order_relaxed); }
+    int64_t stream_held_until_ms() const { return stream_held_until_ms_.load(std::memory_order_relaxed); }
+    void set_stream_held_until_ms(int64_t ms) { stream_held_until_ms_.store(ms, std::memory_order_relaxed); }
+    bool stream_may_read_ahead(); ///< may the file tier read ahead now (stream_init on first use)
     /// The bytes of the expert files this source maps: a pack's `experts.bin` mapping, or the GGUF in place's blobs.
     uint64_t mapped_bytes() const { return mapped_bytes_ != 0 ? mapped_bytes_ : expert_bytes(); }
 private:
     void stream_init();           ///< the reserve (once): stream_reserve_bytes of the host's RAM, the env override
     void stream_update_free();    ///< the MemFree the next window judges the read-ahead by
-    bool stream_may_read_ahead(); ///< may the file tier read ahead now (stream_init on first use)
     /// The free pages are at the brink (under half the reserve): hand the mapped experts' clean pages back, at most once
     /// per 10 s, and keep the read-ahead off for a while after.  The last resort before the kernel's OOM killer.
     void stream_relieve();
     uint64_t stream_reserve_ = 0;
     std::once_flag stream_once_;   ///< the reserve is computed once, whichever thread reads free memory first
     std::atomic<uint64_t> stream_free_{0};
-    /// Written by the decode thread (begin_layer/set_io_prefetch) and read from the stats; `stream_free_` and
-    /// `stream_reliefs_` are atomic because the lookahead thread's warm() may read them too.  The two timestamps below are
-    /// the decode thread's alone (stream_relieve and gate_tick both run from begin_layer).
+    /// Written by the decode thread (begin_layer/set_io_prefetch) and read from the stats; `stream_free_`,
+    /// `stream_reliefs_` and `stream_held_until_ms_` are atomic because the lookahead thread's warm() and I/O workers may read them too.
     std::chrono::steady_clock::time_point stream_free_at_{};   ///< when stream_free_ was last read (throttles the read)
     std::atomic<int64_t> stream_refusals_{0};
     std::atomic<int64_t> stream_reliefs_{0};
     std::atomic<uint64_t> stream_win_bytes_{0};   ///< (atomic) speculative bytes warm() admitted in this decode window
     std::chrono::steady_clock::time_point stream_relief_at_{};
-    std::chrono::steady_clock::time_point gate_hold_until_{};   ///< no read-ahead until then (after a relief)
+    std::atomic<int64_t> stream_held_until_ms_{0};   ///< no read-ahead until then (steady_clock epoch ms, after a relief)
     void gate_tick();
     void gate_capacity();
     bool gate_on_ = false;

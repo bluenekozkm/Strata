@@ -15504,14 +15504,18 @@ int main(int argc, char** argv) {
                 static strata::platform::ProcIo io_prev;
                 static strata::core::FileExpertSource::IoCounters ic_prev;
                 static uint64_t fb_prev = 0;
+                static int64_t reliefs_prev = 0;
                 const strata::platform::ProcIo io_now = strata::platform::proc_io_sample();
                 const strata::core::FileExpertSource::IoCounters ic = src.io_counters();
                 const uint64_t fb = src.file_read_bytes();
+                const int64_t reliefs_now = src.stream_reliefs();
+                const int64_t req_reliefs = reliefs_now - reliefs_prev;
+                reliefs_prev = reliefs_now;
                 if (io_now.valid) {
                     std::fprintf(stderr, "strata serve: file tier I/O this request: the OS read %.1f MB from storage (%llu major faults) for "
                                          "%.1f MB of expert reads, %lld low-memory reliefs", (double) (io_now.read_bytes - io_prev.read_bytes) / 1e6,
                                  (unsigned long long) (io_now.major_faults - io_prev.major_faults), (double) (fb - fb_prev) / 1e6,
-                                 (long long) src.stream_reliefs());
+                                 (long long) req_reliefs);
                     if (src.io_stats())
                         std::fprintf(stderr, "; page cache held %.1f MB at the read, not %.1f MB",
                                      (double) (ic.cached_bytes - ic_prev.cached_bytes) / 1e6,
