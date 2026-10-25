@@ -6636,4 +6636,28 @@ class Cluster5TieredKvCache(unittest.TestCase):
         m = svc.metrics()
         self.assertGreater(m["tiered_kv"]["system_prompt_switches"] + m["tiered_kv"]["system_prompt_hits"], 0)
 
+    def test_extract_system_prompts(self):
+        from serve.server import extract_system_prompts
+
+        # 1. From req["system"] as string and list of blocks (dict and string)
+        self.assertEqual(extract_system_prompts({"system": "sys 1"}), ["sys 1"])
+        self.assertEqual(extract_system_prompts({"system": [{"type": "text", "text": "a"}, "b"]}), ["ab"])
+
+        # 2. From req["messages"] with multipart blocks
+        req_msg = {
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "sys "}, "part 2"]},
+                {"role": "user", "content": "hi"}
+            ]
+        }
+        self.assertEqual(extract_system_prompts(req_msg), ["sys part 2"])
+
+        # 3. From fallback messages argument with string and multipart blocks
+        fallback_msgs = [
+            {"role": "developer", "content": [{"type": "text", "text": "dev "}, "text"]},
+            {"role": "user", "content": "hello"}
+        ]
+        self.assertEqual(extract_system_prompts(None, fallback_msgs), ["dev text"])
+
+
 

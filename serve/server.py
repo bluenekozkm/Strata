@@ -3786,7 +3786,12 @@ def extract_system_prompts(req: dict | None, messages: list[dict] | None = None)
                 if isinstance(c, str):
                     sys_list.append(c)
                 elif isinstance(c, list):
-                    parts = [p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text"]
+                    parts = []
+                    for p in c:
+                        if isinstance(p, dict) and p.get("type") == "text":
+                            parts.append(p.get("text", ""))
+                        elif isinstance(p, str):
+                            parts.append(p)
                     sys_list.append("".join(parts))
     return sys_list
 

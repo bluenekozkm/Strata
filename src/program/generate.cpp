@@ -155,6 +155,7 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 namespace {
 static std::shared_ptr<strata::platform::NvmeCache> g_tiered_nvme_cache;
 static std::atomic<bool> g_tiered_kv_flushed{false};
+static volatile std::sig_atomic_t g_pending_exit_signal{0};
 
 static void flush_tiered_kv_manifest() {
     if (g_tiered_nvme_cache && !g_tiered_kv_flushed.exchange(true)) {
@@ -163,9 +164,7 @@ static void flush_tiered_kv_manifest() {
 }
 
 extern "C" void tiered_kv_signal_handler(int sig) {
-    flush_tiered_kv_manifest();
-    std::signal(sig, SIG_DFL);
-    std::raise(sig);
+    g_pending_exit_signal = sig;
 }
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
@@ -11030,7 +11029,11 @@ int main(int argc, char** argv) {
         }).detach();
         auto next_line = [&](std::string& out) -> bool {
             std::unique_lock<std::mutex> lk(in_mu);
-            in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
+            while (in_lines.empty() && !in_eof) {
+                if (g_pending_exit_signal != 0) return false;
+                in_cv.wait_for(lk, std::chrono::milliseconds(200));
+            }
+            if (g_pending_exit_signal != 0) return false;
             if (in_lines.empty()) return false;
             out = std::move(in_lines.front());
             in_lines.pop_front();
@@ -15766,6 +15769,12 @@ int main(int argc, char** argv) {
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
         flush_tiered_kv_manifest();
+        if (g_pending_exit_signal != 0) {
+            int sig = g_pending_exit_signal;
+            g_pending_exit_signal = 0;
+            std::signal(sig, SIG_DFL);
+            std::raise(sig);
+        }
 #if defined(STRATA_GPU_METAL)
         // the stdin reader (detached above) may still take in_mu when the server closes the pipe after QUIT; on macOS
         // locking that mutex once this scope has destroyed it throws (the engine ended with an abort): end here
