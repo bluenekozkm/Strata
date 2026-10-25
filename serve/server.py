@@ -4594,6 +4594,7 @@ class Service:
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         with self.tiered_kv_lock:
             tkv_metrics = dict(self.tiered_kv_metrics)
+            tkv_metrics["system_prompt_branches"] = len(self.system_prompt_branches)
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "tiered_kv": tkv_metrics,

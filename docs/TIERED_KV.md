@@ -108,18 +108,18 @@ The Persistent Tiered KV Cache addresses this:
 
 ## Measured Performance
 
-Measured on AMD Ryzen 9 9950X3D, Radeon RX 7900 XTX (HIP gfx1201), NVMe SSD, using `tools/tiered_kv_experiment.cpp`:
+Measured on 12th Gen Intel Core i5-12400F, AMD Radeon RX 9070 XT 16 GB (HIP gfx1201), 32 GB RAM, Samsung MZVL2512HCJQ-00BL2 512 GB PCIe 4.0 NVMe SSD (Btrfs), using `tools/tiered_kv_experiment.cpp` with model `Qwen3.8-Flash-Next-Gyro-M` (`kKvHybrid` format, 128 tokens/block):
 
 | Metric | Target SLA | Measured Result |
 | :--- | :---: | :---: |
-| **Block Serialization Throughput** | $> 10,000$ blk/s | **37,846 blocks/s** (26.4 $\mu$s/block) |
-| **Block Deserialization Throughput** | $> 10,000$ blk/s | **45,678 blocks/s** (21.9 $\mu$s/block) |
+| **Block Serialization Throughput** | > 10,000 blk/s | **37,941 blocks/s** (26.36 μs/block) |
+| **Block Deserialization Throughput** | > 10,000 blk/s | **45,543 blocks/s** (21.96 μs/block) |
 | **Roundtrip Bit Integrity** | 100% | **100% Bit Exact** |
-| **NVMe Async Write Bandwidth** | $> 1,000$ MB/s | **2,892.7 MB/s** (0.089 ms/block) |
-| **Zero Cold-Start Manifest Load (100 blocks)** | $< 50$ ms | **0.25 ms** |
-| **Radix Prefix Match Throughput** | $> 100,000$ ops/s | **825,317 lookups/s** (1.21 $\mu$s/lookup) |
-| **Radix Host RAM Overhead (8 $\times$ 4K prompts)** | $< 100$ MB | **129 KB** (0 VRAM penalty) |
-| **Context Switch Latency (4,096 tokens)** | $< 5.0$ ms | **0.0028 ms** (2.85 $\mu$s) |
+| **NVMe Async Write Bandwidth (Direct I/O + fsync)** | > 1,000 MB/s | **29.35 MB/s** (8.78 ms/block on NVMe SSD) / **2,839.9 MB/s** (0.091 ms/block in RAM fallback) |
+| **Zero Cold-Start Manifest Load (100 blocks)** | < 50 ms | **0.31 ms** (100 / 100 blocks indexed) |
+| **Radix Prefix Match Throughput** | > 100,000 ops/s | **818,624 lookups/s** (1.22 μs/lookup) |
+| **Radix Host RAM Overhead (8 $\times$ 4K prompts)** | < 100 MB | **129 KB** (0 VRAM penalty) |
+| **Context Switch Latency (4,096 tokens)** | < 5.0 ms | **0.0023 ms** (2.26 μs avg, 1.76 μs min) |
 | **Fast Prefill Bypass** | Exact prefix | **100% of common tokens skipped** |
 
 ---
