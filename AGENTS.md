@@ -13,7 +13,7 @@ There are two parts:
   in, `T <id>`/`DONE` out, batch `BGEN`/`BT`/`BDONE`/`BADM`/`BSTOP`, samples `BSTAT`/`PSTAT`). How it
   works, with every measured number: [docs/DETAILS.md](docs/DETAILS.md) and
   [docs/paper/Strata-Paper.pdf](docs/paper/Strata-Paper.pdf). AMD: [docs/AMD_HIP.md](docs/AMD_HIP.md).
-  Multi-GPU: [docs/MULTI_GPU.md](docs/MULTI_GPU.md).
+  Multi-GPU: [docs/MULTI_GPU.md](docs/MULTI_GPU.md). Tiered KV: [docs/TIERED_KV.md](docs/TIERED_KV.md).
 - **The server** (`serve/server.py`, Python stdlib only): spawns the engine, serves `/v1/chat/completions`,
   `/v1/messages`, `/v1/responses`, images, metrics and an MCP tool hub on 127.0.0.1. It never binds past
   loopback without an API key. There is no web page; any OpenAI/Anthropic client is the front end.
@@ -34,7 +34,7 @@ model sizes are not in this slim catalog.
   `bench/` (micro-benchmarks and results) is local only — it is in `.gitignore`, never commit it. Keep
   measured claims with what they were measured on; make no claim without a measurement.
 - Keep the docs' style: plain words, short sentences. The docs kept are DETAILS.md, the paper, AMD_HIP,
-  MULTI_GPU and NVFP4; anything else upstream writes stays unmerged (see below).
+  MULTI_GPU, NVFP4 and TIERED_KV; anything else upstream writes stays unmerged (see below).
 
 ## Upstream policy (one-way)
 
