@@ -1,9 +1,6 @@
 > **strata-fabric** — an independent fork of [Strata](https://github.com/Niko1221/Strata), stripped to the core: the
-> inference engine plus its OpenAI- and Anthropic-compatible API server. The README below is rewritten from the original
-> author's README: it keeps the information, the structure and the published measurements, but drops the parts that no
-> longer exist in this fork (the desktop app, the `strata` Terminal, the packaged installers, the update feed, Docker,
-> the SYCL/Metal backends, Intel Arc and the Mac) and rewrites every instruction around what actually exists here:
-> `prepare.py` and `serve/server.py`.
+> inference engine plus its OpenAI- and Anthropic-compatible API server. There are also improvements and customization 
+> features tailored for specific environments.
 >
 > **This fork is work in progress.** It is being actively rebuilt, so a change can break something at any time, and
 > the documentation beyond the kept engine docs ([docs/DETAILS.md](docs/DETAILS.md),
