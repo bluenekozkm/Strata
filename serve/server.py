@@ -3022,7 +3022,7 @@ def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
     layer_split_value)."""
-    args = list(cfg["args"])
+    args = list(cfg.get("args", []))
     # "user_args" (strata_control/user_args.py): the options the person set by hand, over the generated ones at every start,
     # so a setup run or the app rewriting "args" cannot undo them (#3216 #3215 #3270)
     if cfg.get("user_args"):
@@ -3060,8 +3060,9 @@ def engine_args(cfg: dict) -> list[str]:
     # Tiered KV cache (Cluster 5 / Experimental)
     exp_tkv = cfg.get("exp_tiered_kv")
     disk_dir = cfg.get("kv_disk_cache")
-    if exp_tkv or disk_dir:
-        if "--exp-tiered-kv" not in args and "--exp-tiered-kv-cache" not in args:
+    if exp_tkv is not False and (exp_tkv or disk_dir):
+        if not any(arg == "--exp-tiered-kv" or arg.startswith("--exp-tiered-kv=") or
+                   arg == "--exp-tiered-kv-cache" or arg.startswith("--exp-tiered-kv-cache=") for arg in args):
             if isinstance(exp_tkv, str) and exp_tkv.strip():
                 args += ["--exp-tiered-kv", exp_tkv.strip()]
             elif disk_dir:
@@ -3818,6 +3819,8 @@ class Service:
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
         self.exp_tiered_kv = bool(exp_tiered_kv)
         self.exp_tiered_kv_dir = exp_tiered_kv if isinstance(exp_tiered_kv, str) else None
+        if hasattr(self.engine, "info") and isinstance(self.engine.info, dict) and self.exp_tiered_kv_dir:
+            self.engine.info["exp_tiered_kv_dir"] = self.exp_tiered_kv_dir
         self.system_prompt_branches: dict[str, int] = {}
         self.last_system_prompt_hash: str | None = None
         self.tiered_kv_lock = threading.Lock()
@@ -3919,6 +3922,13 @@ class Service:
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
+
+    @property
+    def info(self) -> dict:
+        info_dict = dict(getattr(self.engine, "info", {}) or {})
+        if self.exp_tiered_kv_dir:
+            info_dict["exp_tiered_kv_dir"] = self.exp_tiered_kv_dir
+        return info_dict
 
     def admission_limit(self) -> int | None:
         if self.max_queue is None:
@@ -8362,34 +8372,46 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
     exp_tkv_val = a.exp_tiered_kv if a.exp_tiered_kv is not None else cfg.get("exp_tiered_kv")
-    if not exp_tkv_val:
+    if exp_tkv_val is None:
         args_list = cfg.get("args", [])
-        if "--exp-tiered-kv" in args_list:
-            idx = args_list.index("--exp-tiered-kv")
-            if idx + 1 < len(args_list) and not args_list[idx + 1].startswith("-"):
-                exp_tkv_val = args_list[idx + 1]
-            else:
-                exp_tkv_val = True
-        elif "--exp-tiered-kv-cache" in args_list:
-            idx = args_list.index("--exp-tiered-kv-cache")
-            if idx + 1 < len(args_list) and not args_list[idx + 1].startswith("-"):
-                exp_tkv_val = args_list[idx + 1]
-            else:
-                exp_tkv_val = True
-        elif cfg.get("kv_disk_cache"):
+        for idx, arg in enumerate(args_list):
+            if arg.startswith("--exp-tiered-kv="):
+                exp_tkv_val = arg.split("=", 1)[1]
+                break
+            elif arg.startswith("--exp-tiered-kv-cache="):
+                exp_tkv_val = arg.split("=", 1)[1]
+                break
+            elif arg in ("--exp-tiered-kv", "--exp-tiered-kv-cache"):
+                if idx + 1 < len(args_list) and not args_list[idx + 1].startswith("-"):
+                    exp_tkv_val = args_list[idx + 1]
+                else:
+                    exp_tkv_val = True
+                break
+            elif arg.startswith("--kv-disk-cache="):
+                exp_tkv_val = arg.split("=", 1)[1]
+                break
+            elif arg == "--kv-disk-cache":
+                if idx + 1 < len(args_list) and not args_list[idx + 1].startswith("-"):
+                    exp_tkv_val = args_list[idx + 1]
+                else:
+                    exp_tkv_val = True
+                break
+        if exp_tkv_val is None and cfg.get("kv_disk_cache"):
             exp_tkv_val = cfg["kv_disk_cache"]
     exp_tkv_enabled = bool(exp_tkv_val)
     if exp_tkv_enabled:
         print("[strata] EXPERIMENTAL: Tiered KV Cache is ENABLED (--exp-tiered-kv)", flush=True)
-        tkv_dir = exp_tkv_val if isinstance(exp_tkv_val, str) else cfg.get("kv_disk_cache")
+        tkv_dir = exp_tkv_val if isinstance(exp_tkv_val, str) else (cfg.get("kv_disk_cache") if exp_tkv_val is True else None)
         if not tkv_dir:
             print("[strata] WARNING: Tiered KV Cache running in RAM-only mode (no cache directory specified); "
                   "cached KV states are volatile and will be lost on engine exit or restart!", flush=True)
+    else:
+        tkv_dir = None
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False),
-                  exp_tiered_kv=exp_tkv_val if exp_tkv_enabled else False)
+                  exp_tiered_kv=(tkv_dir if tkv_dir else exp_tkv_val) if exp_tkv_enabled else False)
     svc.launch_attestation = launch_attestation
     svc.offline = a.offline
     svc.max_queue = max_queue

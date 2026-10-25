@@ -101,28 +101,10 @@ The Persistent Tiered KV Cache addresses this:
   - `--exp-tiered-kv [DIR]`: Enables experimental persistent tiered KV cache. If `DIR` is specified, blocks are persisted to SSD via Direct I/O; if omitted, runs in RAM-only mode (Tier 1 Radix tree in host RAM) and logs a warning that cached sessions are volatile and will be lost on engine restart.
   - `--kv-disk-cache DIR`: Persistent disk KV cache directory (implies `--exp-tiered-kv`).
   - `--kv-disk-budget N`: Maximum disk budget in MiB (default: 10240, 10 GiB).
-  - `--kv-multi-system-prompt`: Enables multi-branch radix tree cache in resident `--serve` mode.
+  - `--kv-multi-system-prompt`: Enables multi-branch radix tree cache in resident `--serve` mode. Part of the experimental tiered KV cache suite (activates `--exp-tiered-kv`).
 - **Signal handling**: `SIGINT` and `SIGTERM` handlers flush dirty blocks and synchronize manifest index to disk.
 - **Server integration**: `serve/server.py` recognizes system prompt switches, hashes system prompt prefixes,
   passes `kv_branch=<id>` and `kv_multi_sys=1` to the engine, and tracks hit telemetry under `/metrics`.
-
----
-
-## Measured Performance
-
-Measured on 12th Gen Intel Core i5-12400F, AMD Radeon RX 9070 XT 16 GB (HIP gfx1201), 32 GB RAM, Samsung MZVL2512HCJQ-00BL2 512 GB PCIe 4.0 NVMe SSD (Btrfs), using `tools/tiered_kv_experiment.cpp` with model `Qwen3.8-Flash-Next-Gyro-M` (`kKvHybrid` format, 128 tokens/block):
-
-| Metric | Target SLA | Measured Result |
-| :--- | :---: | :---: |
-| **Block Serialization Throughput** | > 10,000 blk/s | **37,941 blocks/s** (26.36 μs/block) |
-| **Block Deserialization Throughput** | > 10,000 blk/s | **45,543 blocks/s** (21.96 μs/block) |
-| **Roundtrip Bit Integrity** | 100% | **100% Bit Exact** |
-| **NVMe Async Write Bandwidth (Direct I/O + fsync)** | > 1,000 MB/s | **29.35 MB/s** (8.78 ms/block on NVMe SSD) / **2,839.9 MB/s** (0.091 ms/block in RAM fallback) |
-| **Zero Cold-Start Manifest Load (100 blocks)** | < 50 ms | **0.31 ms** (100 / 100 blocks indexed) |
-| **Radix Prefix Match Throughput** | > 100,000 ops/s | **818,624 lookups/s** (1.22 μs/lookup) |
-| **Radix Host RAM Overhead (8 $\times$ 4K prompts)** | < 100 MB | **129 KB** (0 VRAM penalty) |
-| **Context Switch Latency (4,096 tokens)** | < 5.0 ms | **0.0023 ms** (2.26 μs avg, 1.76 μs min) |
-| **Fast Prefill Bypass** | Exact prefix | **100% of common tokens skipped** |
 
 ---
 

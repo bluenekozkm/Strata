@@ -2393,6 +2393,7 @@ int main(int argc, char** argv) {
     }
     bool have_tokens = false;
     bool have_logits_stride = false;
+    bool conversation_cache_mib_set = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -2469,7 +2470,12 @@ int main(int argc, char** argv) {
             } else if (a.rfind("--exp-tiered-kv-cache=", 0) == 0) {
                 o.kv_disk_cache = a.substr(std::string("--exp-tiered-kv-cache=").size());
             } else if (i + 1 < argc && argv[i + 1][0] != '-') {
-                o.kv_disk_cache = argv[++i];
+                std::error_code ec;
+                const std::string_view next_arg = argv[i + 1];
+                if (next_arg.find('/') != std::string_view::npos || next_arg.find('\\') != std::string_view::npos ||
+                    std::filesystem::exists(std::filesystem::path(next_arg), ec)) {
+                    o.kv_disk_cache = argv[++i];
+                }
             }
         }
         else if (a == "--kv-disk-cache") {
@@ -2486,7 +2492,10 @@ int main(int argc, char** argv) {
             }
             o.kv_disk_budget_mib = mb;
         }
-        else if (a == "--kv-multi-system-prompt") o.kv_multi_system_prompt = true;
+        else if (a == "--kv-multi-system-prompt") {
+            o.kv_multi_system_prompt = true;
+            o.exp_tiered_kv = true;
+        }
         else if (a == "--stream-token") o.stream_token = true;
         else if (a == "--check-logits") o.check_logits = true;
         else if (a == "--gr-fp32-activations") o.gr_fp32_activations = true;
@@ -2658,7 +2667,10 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
                 return 2;
             }
-            if (a == "--conversation-cache-mib") o.conversation_cache_mib = number;
+            if (a == "--conversation-cache-mib") {
+                o.conversation_cache_mib = number;
+                conversation_cache_mib_set = true;
+            }
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = number;
             else if (a == "--conversation-cache-park-gain") o.conversation_cache_park_gain = number;
@@ -2950,6 +2962,10 @@ int main(int argc, char** argv) {
                              (long long) o.conversation_cache_min_free_mib);
             }
         }
+    }
+    if (o.exp_tiered_kv && !conversation_cache_mib_set) {
+        o.conversation_cache_mib = 4096;
+        if (o.conversation_cache_slots <= 0) o.conversation_cache_slots = 8;
     }
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
@@ -8321,10 +8337,6 @@ int main(int argc, char** argv) {
 
         if (o.exp_tiered_kv) {
             std::fprintf(stderr, "[strata] EXPERIMENTAL: Tiered KV Cache is ENABLED (--exp-tiered-kv)\n");
-            if (o.conversation_cache_mib == 0) {
-                o.conversation_cache_mib = 4096;
-                if (o.conversation_cache_slots <= 0) o.conversation_cache_slots = 8;
-            }
             if (!o.kv_disk_cache.empty()) {
                 strata::platform::NvmeCacheConfig nvme_cfg;
                 nvme_cfg.cache_dir = o.kv_disk_cache;
@@ -8341,6 +8353,9 @@ int main(int argc, char** argv) {
             }
 
             strata::core::RadixConvCacheConfig radix_cfg;
+            radix_cfg.host_ram_budget_bytes = (o.conversation_cache_mib > 0)
+                ? (static_cast<size_t>(o.conversation_cache_mib) * 1024ULL * 1024ULL)
+                : (2ULL * 1024 * 1024 * 1024);
             radix_cfg.format = (o.kv == "int8") ? strata::core::kKvInt8
                              : (o.kv == "k8v4") ? strata::core::kKvHybrid
                              : (o.kv == "q4_0") ? strata::core::kKvQ4

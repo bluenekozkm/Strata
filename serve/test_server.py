@@ -6391,7 +6391,7 @@ class Cluster5TieredKvCache(unittest.TestCase):
         self.assertEqual(args_idem.count("--kv-multi-system-prompt"), 1)
 
     def test_cli_flags_parsing(self):
-        # Verify CLI flag parsing for --exp-tiered-kv and --exp-tiered-kv-cache
+        # 1. Verify CLI flag parsing for --exp-tiered-kv and --exp-tiered-kv-cache
         import argparse
         ap = argparse.ArgumentParser()
         ap.add_argument("--exp-tiered-kv", nargs="?", const=True, default=None, metavar="DIR")
@@ -6408,6 +6408,43 @@ class Cluster5TieredKvCache(unittest.TestCase):
 
         parsed_alias = ap.parse_args(["--exp-tiered-kv-cache", "/var/cache/strata"])
         self.assertEqual(parsed_alias.exp_tiered_kv, "/var/cache/strata")
+
+        parsed_eq = ap.parse_args(["--exp-tiered-kv=/var/cache/strata"])
+        self.assertEqual(parsed_eq.exp_tiered_kv, "/var/cache/strata")
+
+        # 2. Verify engine_args() with various combinations
+        # When args already has --exp-tiered-kv=/path
+        args_eq = engine_args({"args": ["--exp-tiered-kv=/path"], "exp_tiered_kv": "/path"})
+        self.assertEqual(args_eq, ["--exp-tiered-kv=/path"])
+
+        # When args already has --exp-tiered-kv-cache=/path
+        args_cache_eq = engine_args({"args": ["--exp-tiered-kv-cache=/path"], "exp_tiered_kv": "/path"})
+        self.assertEqual(args_cache_eq, ["--exp-tiered-kv-cache=/path"])
+
+        # When args already has bare --exp-tiered-kv
+        args_bare = engine_args({"args": ["--exp-tiered-kv"], "exp_tiered_kv": True})
+        self.assertEqual(args_bare, ["--exp-tiered-kv"])
+
+        # When cfg["exp_tiered_kv"] = False, it should NOT add --exp-tiered-kv even if kv_disk_cache is set
+        args_disabled = engine_args({"exp_tiered_kv": False, "kv_disk_cache": "/path"})
+        self.assertNotIn("--exp-tiered-kv", args_disabled)
+
+        # When cfg["exp_tiered_kv"] = False without disk cache
+        args_disabled_plain = engine_args({"exp_tiered_kv": False})
+        self.assertNotIn("--exp-tiered-kv", args_disabled_plain)
+
+        # When cfg["kv_disk_cache"] is set and exp_tiered_kv is not specified
+        args_disk_only = engine_args({"kv_disk_cache": "/path"})
+        self.assertIn("--exp-tiered-kv", args_disk_only)
+        self.assertEqual(args_disk_only[args_disk_only.index("--exp-tiered-kv") + 1], "/path")
+
+        # 3. Verify Service exposes exp_tiered_kv_dir and Service.info
+        tok = ByteTokenizer()
+        engine = RecordingEngine(tok, "response text", max_context=4096)
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), exp_tiered_kv="/var/cache/strata")
+        self.assertTrue(svc.exp_tiered_kv)
+        self.assertEqual(svc.exp_tiered_kv_dir, "/var/cache/strata")
+        self.assertEqual(svc.info.get("exp_tiered_kv_dir"), "/var/cache/strata")
 
     def test_alternating_system_prompts_and_telemetry(self):
         tok = ByteTokenizer()
