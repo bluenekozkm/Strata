@@ -410,6 +410,9 @@ void test_stream_memory_guard() {
     const std::string warn = mapped_memory_warning(50 * GiB, 64 * GiB);
     require(warn.find("78%") != std::string::npos && warn.find("STRATA_IO_PF_RESERVE_GIB") != std::string::npos,
             "the mapped-memory warning is incomplete");
+    const std::string warn_custom = mapped_memory_warning(50 * GiB, 64 * GiB, 6 * GiB);
+    require(warn_custom.find("keeps 6.0 GiB free") != std::string::npos,
+            "the custom reserve was not reported in the warning");
 }
 
 // #1250: when the page-locked complement is registered in steps, and what a meminfo reading says

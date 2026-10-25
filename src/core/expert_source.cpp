@@ -152,15 +152,21 @@ uint64_t speculative_window_bytes(uint64_t free_now, uint64_t reserve, uint64_t 
     return std::min(want, room / 4);
 }
 
-std::string mapped_memory_warning(uint64_t mapped, uint64_t total_ram) {
+std::string mapped_memory_warning(uint64_t mapped, uint64_t total_ram, uint64_t reserve) {
     if (mapped == 0 || total_ram == 0 || mapped * 10 <= total_ram * 6) return "";
+    if (reserve == 0) {
+        if (const char* v = std::getenv("STRATA_IO_PF_RESERVE_GIB"); v != nullptr && std::atof(v) > 0.0)
+            reserve = (uint64_t) (std::atof(v) * 1073741824.0);
+        else
+            reserve = stream_reserve_bytes(total_ram);
+    }
     char msg[512];
     std::snprintf(msg, sizeof msg,
                   "the model files mapped for the experts (%.1f GiB) are %.0f%% of this PC's %.1f GiB of RAM: the page "
                   "cache cannot hold them, so the file tier streams them and keeps %.1f GiB free "
                   "(STRATA_IO_PF_RESERVE_GIB); a smaller model, a smaller --max-context or more RAM is the long-term fix",
                   (double) mapped / 1073741824.0, 100.0 * (double) mapped / (double) total_ram,
-                  (double) total_ram / 1073741824.0, (double) stream_reserve_bytes(total_ram) / 1073741824.0);
+                  (double) total_ram / 1073741824.0, (double) reserve / 1073741824.0);
     return msg;
 }
 

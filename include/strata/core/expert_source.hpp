@@ -127,8 +127,9 @@ bool speculative_gate_room(bool open, uint64_t free_now, uint64_t reserve);
 /// (0 when they are at or under it).
 uint64_t speculative_window_bytes(uint64_t free_now, uint64_t reserve, uint64_t want);
 /// One line for the start when the model files this source maps exceed 60% of the host's RAM - the page cache cannot hold
-/// them, so the file tier streams and keeps its reserve - else "".  `total_ram` 0: nothing to say.
-std::string mapped_memory_warning(uint64_t mapped, uint64_t total_ram);
+/// them, so the file tier streams and keeps its reserve - else "".  `total_ram` 0: nothing to say.  `reserve` 0: the
+/// host's default or STRATA_IO_PF_RESERVE_GIB.
+std::string mapped_memory_warning(uint64_t mapped, uint64_t total_ram, uint64_t reserve = 0);
 /// The host's RAM (Linux MemTotal, Windows total physical memory); 0 when it cannot be read.
 uint64_t system_ram_bytes();
 
