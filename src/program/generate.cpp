@@ -39,6 +39,11 @@
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
+#include "strata/core/kv_block.hpp"
+#include "strata/platform/nvme_cache.hpp"
+#include "strata/core/radix_conv_cache.hpp"
+#include "strata/core/context_switcher.hpp"
+#include <csignal>
 #include "strata/core/ring_wait.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
@@ -148,6 +153,20 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <vector>
 
 namespace {
+static std::shared_ptr<strata::platform::NvmeCache> g_tiered_nvme_cache;
+static std::atomic<bool> g_tiered_kv_flushed{false};
+
+static void flush_tiered_kv_manifest() {
+    if (g_tiered_nvme_cache && !g_tiered_kv_flushed.exchange(true)) {
+        g_tiered_nvme_cache->flush_sync();
+    }
+}
+
+extern "C" void tiered_kv_signal_handler(int sig) {
+    flush_tiered_kv_manifest();
+    std::signal(sig, SIG_DFL);
+    std::raise(sig);
+}
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
 // a Linux driver has no such limit (#253: the 8 GiB cap cost a 4090 + 3060 split 3x of its prompt speed).
@@ -483,6 +502,9 @@ struct Options {
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
+    std::string kv_disk_cache;         ///< persistent disk KV cache directory (empty = off)
+    int64_t kv_disk_budget_mib = 10240; ///< SSD budget in MiB (default 10GB)
+    bool kv_multi_system_prompt = false; ///< enable host-side multi-branch radix tree cache
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the 794 MB GEMV does not.
@@ -828,6 +850,9 @@ void usage() {
                  "                       cache holds the rest, giving slots back as the context grows (one GPU, with\n"
                  "                       --expert-profile; STRATA_KV_GROW=1/0 also). Default: the whole --max-context\n"
                  "                       allocated at start\n"
+                 "  --kv-disk-cache DIR  persistent disk KV cache directory (empty = off)\n"
+                 "  --kv-disk-budget N   persistent disk KV cache budget in MiB (default 10240)\n"
+                 "  --kv-multi-system-prompt enable host-side multi-branch radix tree cache\n"
                  "  --stream-token       enqueue token work on the session stream (experimental)\n"
                  "  --check-logits       copy and check all logits in the stream-token path\n"
                  "  --gr-fp32-activations  experimental CUDA-oracle GR activation precision\n"
@@ -2256,6 +2281,7 @@ int main(int argc, char** argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::atexit(flush_tiered_kv_manifest);
 #if defined(STRATA_USE_HIP) && defined(_WIN32)
     {   // 0.2.1.2: hipblas / libhipblaslt / rocblas are delay-loaded (CMakeLists.txt) and live in <exe folder>\rocm\bin, which only the
         // launcher puts on PATH; make the folder part of this process's DLL search, so `strata.exe --version` run straight from the
@@ -2432,6 +2458,18 @@ int main(int argc, char** argv) {
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
         else if (a == "--kv-grow") o.kv_grow = true;
         else if (a == "--no-kv-grow") o.kv_grow = false;
+        else if (a == "--kv-disk-cache") o.kv_disk_cache = next("--kv-disk-cache");
+        else if (a == "--kv-disk-budget") {
+            const char* v = next("--kv-disk-budget");
+            char* end = nullptr;
+            const long long mb = std::strtoll(v, &end, 10);
+            if (end == v || *end != '\0' || mb <= 0) {
+                std::fprintf(stderr, "strata generate: --kv-disk-budget expects a positive integer in MiB\n");
+                return 2;
+            }
+            o.kv_disk_budget_mib = mb;
+        }
+        else if (a == "--kv-multi-system-prompt") o.kv_multi_system_prompt = true;
         else if (a == "--stream-token") o.stream_token = true;
         else if (a == "--check-logits") o.check_logits = true;
         else if (a == "--gr-fp32-activations") o.gr_fp32_activations = true;
@@ -8259,6 +8297,45 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: the prompt path reads the experts a helper cache holds from that "
                                  "cache (STRATA_PREFILL_HELPER_SOURCE)\n");
         }
+        // ---- Tiered KV Cache Initialization (Cluster 5) ----
+        std::shared_ptr<strata::platform::NvmeCache> nvme_cache;
+        std::shared_ptr<strata::core::RadixConvCache> radix_cache;
+        std::shared_ptr<strata::core::ContextSwitcher> context_switcher;
+
+        if (!o.kv_disk_cache.empty() || o.kv_multi_system_prompt) {
+            if (!o.kv_disk_cache.empty()) {
+                strata::platform::NvmeCacheConfig nvme_cfg;
+                nvme_cfg.cache_dir = o.kv_disk_cache;
+                nvme_cfg.disk_budget_bytes = static_cast<size_t>(o.kv_disk_budget_mib) * 1024ULL * 1024ULL;
+                nvme_cache = std::make_shared<strata::platform::NvmeCache>(nvme_cfg);
+                g_tiered_nvme_cache = nvme_cache;
+                std::signal(SIGINT, tiered_kv_signal_handler);
+                std::signal(SIGTERM, tiered_kv_signal_handler);
+                std::fprintf(stderr, "strata serve: initialized Tiered NvmeCache at '%s' (budget %lld MiB)\n",
+                             o.kv_disk_cache.c_str(), (long long) o.kv_disk_budget_mib);
+            }
+            if (o.kv_multi_system_prompt || nvme_cache != nullptr) {
+                strata::core::RadixConvCacheConfig radix_cfg;
+                radix_cfg.format = (o.kv == "int8") ? strata::core::kKvInt8
+                                 : (o.kv == "k8v4") ? strata::core::kKvHybrid
+                                 : (o.kv == "q4_0") ? strata::core::kKvQ4
+                                 : strata::core::kKvF16;
+                radix_cfg.num_layers = static_cast<uint32_t>(g.n_layers);
+                radix_cfg.num_heads = static_cast<uint32_t>(g.n_head_kv);
+                radix_cfg.head_dim = static_cast<uint32_t>(g.head_dim);
+                radix_cache = std::make_shared<strata::core::RadixConvCache>(radix_cfg);
+
+                strata::core::ContextSwitcherConfig cs_cfg;
+                cs_cfg.format = radix_cfg.format;
+                cs_cfg.num_layers = radix_cfg.num_layers;
+                cs_cfg.num_heads = radix_cfg.num_heads;
+                cs_cfg.head_dim = radix_cfg.head_dim;
+                cs_cfg.enable_fast_prefill_bypass = true;
+                context_switcher = std::make_shared<strata::core::ContextSwitcher>(radix_cache, nvme_cache, cs_cfg);
+                std::fprintf(stderr, "strata serve: initialized RadixConvCache and ContextSwitcher (fast prefill bypass enabled)\n");
+            }
+        }
+
         strata::prefill::Prefill sp;
         // 149-prefetch STRATA_RAM_ADAPT2=1 (with STRATA_RAM_ADAPT=n, the promotions staged per window): see the window loop
         struct RamAdapt2 {
@@ -12250,6 +12327,8 @@ int main(int argc, char** argv) {
             // a parked conversation holding it stays parked) and a later request that resumes from it does not park the
             // branch it leaves: N queries cost one prefix, not N.  Absent = as before.
             int64_t req_pin = 0;
+            int64_t req_kv_branch = -1;
+            bool req_kv_multi_sys = false;
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
@@ -12289,6 +12368,8 @@ int main(int argc, char** argv) {
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "pipe") req_pipe = std::max(0.0, (double) fv);
                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
+                    else if (key == "kv_branch") req_kv_branch = std::atoll(tok.c_str() + eq + 1);
+                    else if (key == "kv_multi_sys") req_kv_multi_sys = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "img_keys") {
                         req_img_keys.clear();
                         const char* q = tok.c_str() + eq + 1;
@@ -15645,6 +15726,7 @@ int main(int argc, char** argv) {
             }
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
+        flush_tiered_kv_manifest();
 #if defined(STRATA_GPU_METAL)
         // the stdin reader (detached above) may still take in_mu when the server closes the pipe after QUIT; on macOS
         // locking that mutex once this scope has destroyed it throws (the engine ended with an abort): end here

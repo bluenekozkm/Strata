@@ -1,4 +1,4 @@
-﻿# Strata Engine - top-level build (P1.S1).
+# Strata Engine - top-level build (P1.S1).
 #
 # Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
@@ -326,8 +326,10 @@ target_link_libraries(strata-plan PRIVATE strata_plan)
 # ---- strata_core (GPU runtime) ---------------------------------------------
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+  find_package(Threads REQUIRED)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
-                               src/core/layout.cpp)
+                               src/core/layout.cpp src/core/kv_block.cpp src/platform/nvme_cache.cpp src/core/radix_conv_cache.cpp
+                               src/core/context_switcher.cpp)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   if(STRATA_ENABLE_CUDA AND STRATA_EXPERIMENTAL_SM60)
     # the runtime device check (src/core/device.cu) admits the cards this build was made for (#236)
@@ -336,7 +338,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
   # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
   # linker error ("unresolved external symbol cudaGraphInstantiate") names the function rather than the cause.
-  target_link_libraries(strata_core PUBLIC strata_plan strata_warnings ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_core PUBLIC strata_plan strata_warnings ${_strata_gpu_runtime_target} Threads::Threads)
 
   add_executable(strata-device src/core/device_main.cpp)
   target_link_libraries(strata-device PRIVATE strata_core)
@@ -1409,6 +1411,27 @@ if(STRATA_BUILD_TESTS)
   add_executable(uma_cache_test src/core/uma_cache_test.cpp)
   target_include_directories(uma_cache_test PRIVATE include)
   add_test(NAME uma_cache_test COMMAND uma_cache_test)
+  add_executable(kv_block_test src/core/kv_block_test.cpp src/core/kv_block.cpp)
+  target_include_directories(kv_block_test PRIVATE include)
+  target_link_libraries(kv_block_test PRIVATE strata_warnings)
+  add_test(NAME kv_block_test COMMAND kv_block_test)
+  find_package(Threads REQUIRED)
+  add_executable(nvme_cache_test src/platform/nvme_cache_test.cpp src/platform/nvme_cache.cpp src/core/kv_block.cpp)
+  target_include_directories(nvme_cache_test PRIVATE include)
+  target_link_libraries(nvme_cache_test PRIVATE strata_warnings Threads::Threads)
+  add_test(NAME nvme_cache_test COMMAND nvme_cache_test)
+  add_executable(radix_conv_cache_test src/core/radix_conv_cache_test.cpp src/core/radix_conv_cache.cpp src/core/kv_block.cpp)
+  target_include_directories(radix_conv_cache_test PRIVATE include)
+  target_link_libraries(radix_conv_cache_test PRIVATE strata_warnings Threads::Threads)
+  add_test(NAME radix_conv_cache_test COMMAND radix_conv_cache_test)
+  add_executable(context_switcher_test src/core/context_switcher_test.cpp src/core/context_switcher.cpp src/core/radix_conv_cache.cpp src/platform/nvme_cache.cpp src/core/kv_block.cpp)
+  target_include_directories(context_switcher_test PRIVATE include)
+  target_link_libraries(context_switcher_test PRIVATE strata_warnings Threads::Threads)
+  add_test(NAME context_switcher_test COMMAND context_switcher_test)
+
+  add_executable(tiered_kv_experiment tools/tiered_kv_experiment.cpp src/core/context_switcher.cpp src/core/radix_conv_cache.cpp src/platform/nvme_cache.cpp src/core/kv_block.cpp)
+  target_include_directories(tiered_kv_experiment PRIVATE include)
+  target_link_libraries(tiered_kv_experiment PRIVATE strata_warnings Threads::Threads)
   add_executable(suffix_drafter_test src/spec/suffix_drafter_test.cpp)
   target_link_libraries(suffix_drafter_test PRIVATE strata_spec)
   add_test(NAME suffix_drafter_test COMMAND suffix_drafter_test)

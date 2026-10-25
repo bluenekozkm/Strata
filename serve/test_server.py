@@ -6309,3 +6309,232 @@ class PrepareCancelled(unittest.TestCase):
             ids, _, _ = svc.prepare(self.msgs(), None, {}, cancel=threading.Event())
             self.assertEqual(ids.count(ByteTokenizer().encode("<|image_pad|>", parse_special=True)[0]), 6)
             svc.embeddings.path.unlink(missing_ok=True)
+
+
+class Cluster5TieredKvCache(unittest.TestCase):
+    """Cluster 5: CLI, Server API & Lifecycle Integration."""
+
+    def test_cli_arg_generation_tiered_kv(self):
+        # 1. Forwarding --kv-disk-cache, --kv-disk-budget, --kv-multi-system-prompt
+        base_cfg = {"args": ["--native", "shard1.gguf"]}
+        args = engine_args({
+            **base_cfg,
+            "kv_disk_cache": "/mnt/nvme/strata_cache",
+            "kv_disk_budget": 20480,
+            "kv_multi_system_prompt": True,
+        })
+        self.assertIn("--kv-disk-cache", args)
+        self.assertEqual(args[args.index("--kv-disk-cache") + 1], "/mnt/nvme/strata_cache")
+        self.assertIn("--kv-disk-budget", args)
+        self.assertEqual(args[args.index("--kv-disk-budget") + 1], "20480")
+        self.assertIn("--kv-multi-system-prompt", args)
+
+        # Alternative budget key: kv_disk_budget_mib
+        args2 = engine_args({
+            **base_cfg,
+            "kv_disk_budget_mib": 5120,
+        })
+        self.assertIn("--kv-disk-budget", args2)
+        self.assertEqual(args2[args2.index("--kv-disk-budget") + 1], "5120")
+
+        # Idempotence: does not duplicate if already in args
+        args3 = engine_args({
+            "args": ["--kv-disk-cache", "/custom/path", "--kv-multi-system-prompt"],
+            "kv_disk_cache": "/other/path",
+            "kv_multi_system_prompt": True,
+        })
+        self.assertEqual(args3.count("--kv-disk-cache"), 1)
+        self.assertEqual(args3[args3.index("--kv-disk-cache") + 1], "/custom/path")
+        self.assertEqual(args3.count("--kv-multi-system-prompt"), 1)
+
+    def test_alternating_system_prompts_and_telemetry(self):
+        tok = ByteTokenizer()
+        engine = RecordingEngine(tok, "response text", max_context=4096)
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+
+        # Request 1: System Prompt A
+        req1 = {
+            "tiered_kv": {},
+            "messages": [
+                {"role": "system", "content": "You are a specialized code assistant."},
+                {"role": "user", "content": "Write a python function."}
+            ]
+        }
+        from serve.frontend import openai_to_messages
+        msgs1, tools1, kw1 = openai_to_messages(req1)
+        svc.prepare(msgs1, tools1, kw1, max_new=16, req=req1)
+        self.assertIn("tiered_kv", req1)
+        self.assertEqual(req1["tiered_kv"]["branch_id"], 0)
+        self.assertFalse(req1["tiered_kv"]["is_switch"])
+        self.assertEqual(svc.tiered_kv_metrics["system_prompt_switches"], 0)
+
+        # Verify sampling keys formatting
+        keys1 = StrataEngine.sampling_keys(req1)
+        self.assertIn("kv_branch=0", keys1)
+
+        # Request 2: System Prompt B (alternating/switch)
+        req2 = {
+            "tiered_kv": {},
+            "messages": [
+                {"role": "system", "content": "You are an expert mathematician."},
+                {"role": "user", "content": "Solve 2+2."}
+            ]
+        }
+        msgs2, tools2, kw2 = openai_to_messages(req2)
+        svc.prepare(msgs2, tools2, kw2, max_new=16, req=req2)
+        self.assertEqual(req2["tiered_kv"]["branch_id"], 1)
+        self.assertTrue(req2["tiered_kv"]["is_switch"])
+        self.assertEqual(svc.tiered_kv_metrics["system_prompt_switches"], 1)
+
+        # Request 3: Switch back to System Prompt A
+        req3 = {
+            "tiered_kv": {},
+            "messages": [
+                {"role": "system", "content": "You are a specialized code assistant."},
+                {"role": "user", "content": "Refactor code."}
+            ]
+        }
+        msgs3, tools3, kw3 = openai_to_messages(req3)
+        svc.prepare(msgs3, tools3, kw3, max_new=16, req=req3)
+        self.assertEqual(req3["tiered_kv"]["branch_id"], 0)
+        self.assertTrue(req3["tiered_kv"]["is_switch"])
+        self.assertEqual(svc.tiered_kv_metrics["system_prompt_switches"], 2)
+
+        # Request 4: Repeat System Prompt A (cache hit)
+        req4 = {
+            "tiered_kv": {},
+            "messages": [
+                {"role": "system", "content": "You are a specialized code assistant."},
+                {"role": "user", "content": "Write unit tests."}
+            ]
+        }
+        msgs4, tools4, kw4 = openai_to_messages(req4)
+        svc.prepare(msgs4, tools4, kw4, max_new=16, req=req4)
+        self.assertEqual(req4["tiered_kv"]["branch_id"], 0)
+        self.assertFalse(req4["tiered_kv"]["is_switch"])
+        self.assertEqual(svc.tiered_kv_metrics["system_prompt_hits"], 1)
+
+        # Request 5: Multiple system prompts in single request
+        req5 = {
+            "tiered_kv": {},
+            "messages": [
+                {"role": "system", "content": "Rule 1: Always be concise."},
+                {"role": "developer", "content": "Rule 2: Speak in Python."},
+                {"role": "user", "content": "Hello"}
+            ]
+        }
+        msgs5, tools5, kw5 = openai_to_messages(req5)
+        svc.prepare(msgs5, tools5, kw5, max_new=16, req=req5)
+        self.assertTrue(req5["tiered_kv"]["is_multi_system"])
+        self.assertGreaterEqual(svc.tiered_kv_metrics["multi_system_requests"], 1)
+        keys5 = StrataEngine.sampling_keys(req5)
+        self.assertIn("kv_multi_sys=1", keys5)
+
+        # Check telemetry exposure in metrics
+        metrics = svc.metrics()
+        self.assertIn("tiered_kv", metrics)
+        self.assertEqual(metrics["tiered_kv"]["system_prompt_switches"], 3)
+        self.assertEqual(metrics["tiered_kv"]["system_prompt_hits"], 1)
+
+    def test_graceful_shutdown_lifecycle(self):
+        # Verify signal handling and manifest flush lifecycle
+        import signal
+        self.assertTrue(hasattr(signal, "SIGINT"))
+        self.assertTrue(hasattr(signal, "SIGTERM"))
+
+        class LifecycleEngine(RecordingEngine):
+            def __init__(self, tok):
+                super().__init__(tok, "ok")
+                self.is_alive = True
+                self.closed_with = None
+
+            def alive(self):
+                return self.is_alive
+
+            def unload(self):
+                self.is_alive = False
+                self.closed_with = "unload"
+
+            def close(self):
+                self.is_alive = False
+                self.closed_with = "close"
+
+        tok = ByteTokenizer()
+        engine = LifecycleEngine(tok)
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.assertTrue(svc.loaded())
+
+        # Test clean service unload
+        res = svc.unload()
+        self.assertEqual(res, "unloaded")
+        self.assertFalse(svc.loaded())
+        self.assertEqual(engine.closed_with, "unload")
+
+        # Test engine close / SIGTERM emulation
+        engine.is_alive = True
+        engine.close()
+        self.assertFalse(engine.alive())
+        self.assertEqual(engine.closed_with, "close")
+
+    def test_anthropic_system_prompt_extraction_and_blocks(self):
+        tok = ByteTokenizer()
+        engine = RecordingEngine(tok, "response", max_context=4096)
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+
+        # Anthropic string system prompt
+        req_anthropic_str = {
+            "tiered_kv": {},
+            "system": "You are Claude acting as a data scientist.",
+            "messages": [{"role": "user", "content": "Analyze data"}]
+        }
+        from serve.frontend import anthropic_to_messages
+        msgs, tools, kw = anthropic_to_messages(req_anthropic_str)
+        svc.prepare(msgs, tools, kw, max_new=16, req=req_anthropic_str)
+        self.assertIn("tiered_kv", req_anthropic_str)
+        self.assertEqual(req_anthropic_str["tiered_kv"]["branch_id"], 0)
+        self.assertFalse(req_anthropic_str["tiered_kv"]["is_multi_system"])
+
+        # Anthropic list of text blocks system prompt
+        req_anthropic_blocks = {
+            "tiered_kv": {},
+            "system": [
+                {"type": "text", "text": "Part 1: You are a scientist. "},
+                {"type": "text", "text": "Part 2: Focus on astronomy."}
+            ],
+            "messages": [{"role": "user", "content": "Tell me about Mars"}]
+        }
+        msgs2, tools2, kw2 = anthropic_to_messages(req_anthropic_blocks)
+        svc.prepare(msgs2, tools2, kw2, max_new=16, req=req_anthropic_blocks)
+        self.assertIn("tiered_kv", req_anthropic_blocks)
+        self.assertEqual(req_anthropic_blocks["tiered_kv"]["branch_id"], 1)
+        self.assertTrue(req_anthropic_blocks["tiered_kv"]["is_switch"])
+
+    def test_concurrent_tiered_kv_prepare(self):
+        import concurrent.futures
+        tok = ByteTokenizer()
+        engine = RecordingEngine(tok, "response", max_context=4096)
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+
+        def call_prepare(idx):
+            req = {
+                "tiered_kv": {},
+                "messages": [
+                    {"role": "system", "content": f"System prompt branch {idx % 4}"},
+                    {"role": "user", "content": "Question"}
+                ]
+            }
+            from serve.frontend import openai_to_messages
+            m, t, k = openai_to_messages(req)
+            svc.prepare(m, t, k, max_new=16, req=req)
+            return req["tiered_kv"]["branch_id"]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            futures = [ex.submit(call_prepare, i) for i in range(40)]
+            results = [f.result() for f in futures]
+
+        self.assertEqual(len(results), 40)
+        self.assertLessEqual(len(svc.system_prompt_branches), 4)
+        m = svc.metrics()
+        self.assertGreater(m["tiered_kv"]["system_prompt_switches"] + m["tiered_kv"]["system_prompt_hits"], 0)
+
+

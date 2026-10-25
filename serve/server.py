@@ -401,6 +401,7 @@ class MockEngine:
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_prompt = list(ids)
         self.last_embeddings = embeddings
+        self.last_sampling = sampling
         if len(self.scripts) > 1:
             if self.cycle:
                 self.script = self.scripts[self.turns % len(self.scripts)]
@@ -1497,6 +1498,14 @@ class StrataEngine:
             pn = prefix.get("tokens")
             if isinstance(pn, int) and not isinstance(pn, bool) and pn > 0:
                 keys += f" pin={pn}"
+        # Tiered KV cache (Cluster 5): branch and multi-system metadata
+        tkv = sampling.get("tiered_kv")
+        if isinstance(tkv, dict):
+            bid = tkv.get("branch_id")
+            if isinstance(bid, int):
+                keys += f" kv_branch={bid}"
+            if tkv.get("is_multi_system"):
+                keys += " kv_multi_sys=1"
         return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias"))
 
     @staticmethod
@@ -3048,6 +3057,15 @@ def engine_args(cfg: dict) -> list[str]:
         seg = cfg.get("vram_segment_mib")
         if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
             args += ["--vram-segment-mib", str(seg)]
+    # Tiered KV cache (Cluster 5)
+    if cfg.get("kv_disk_cache") and "--kv-disk-cache" not in args:
+        args += ["--kv-disk-cache", str(cfg["kv_disk_cache"])]
+    if cfg.get("kv_disk_budget") is not None and "--kv-disk-budget" not in args:
+        args += ["--kv-disk-budget", str(cfg["kv_disk_budget"])]
+    elif cfg.get("kv_disk_budget_mib") is not None and "--kv-disk-budget" not in args:
+        args += ["--kv-disk-budget", str(cfg["kv_disk_budget_mib"])]
+    if cfg.get("kv_multi_system_prompt") is True and "--kv-multi-system-prompt" not in args:
+        args.append("--kv-multi-system-prompt")
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
     return learned_profile_args(cfg, args)
@@ -3723,6 +3741,47 @@ def slot_save_dir(value, base: str | None = None) -> str:
         raise ValueError(f"slot_save_path {path} is not a directory")
     return path
 
+def extract_system_prompts(req: dict | None, messages: list[dict] | None = None) -> list[str]:
+    """Extract list of system prompt contents from req and/or messages."""
+    sys_list = []
+    if req and isinstance(req, dict):
+        sys_field = req.get("system")
+        if sys_field:
+            if isinstance(sys_field, str):
+                sys_list.append(sys_field)
+            elif isinstance(sys_field, list):
+                parts = []
+                for b in sys_field:
+                    if isinstance(b, dict) and b.get("type") == "text":
+                        parts.append(b.get("text", ""))
+                    elif isinstance(b, str):
+                        parts.append(b)
+                sys_list.append("".join(parts))
+        for m in (req.get("messages") or []):
+            if isinstance(m, dict) and m.get("role") in ("system", "developer"):
+                c = m.get("content")
+                if isinstance(c, str):
+                    sys_list.append(c)
+                elif isinstance(c, list):
+                    parts = []
+                    for p in c:
+                        if isinstance(p, dict) and p.get("type") == "text":
+                            parts.append(p.get("text", ""))
+                        elif isinstance(p, str):
+                            parts.append(p)
+                    sys_list.append("".join(parts))
+    if not sys_list and messages and isinstance(messages, list):
+        for m in messages:
+            if isinstance(m, dict) and m.get("role") in ("system", "developer"):
+                c = m.get("content")
+                if isinstance(c, str):
+                    sys_list.append(c)
+                elif isinstance(c, list):
+                    parts = [p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text"]
+                    sys_list.append("".join(parts))
+    return sys_list
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -3749,6 +3808,15 @@ class Service:
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
+        self.system_prompt_branches: dict[str, int] = {}
+        self.last_system_prompt_hash: str | None = None
+        self.tiered_kv_lock = threading.Lock()
+        self.tiered_kv_metrics: dict[str, int] = {
+            "system_prompt_switches": 0,
+            "system_prompt_hits": 0,
+            "multi_system_requests": 0,
+        }
+        self.last_tiered_kv: dict | None = None
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
@@ -4524,8 +4592,11 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        with self.tiered_kv_lock:
+            tkv_metrics = dict(self.tiered_kv_metrics)
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+                "tiered_kv": tkv_metrics,
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
@@ -4704,6 +4775,36 @@ class Service:
         prompt; with thinking, Service.run writes it once the thinking is over."""
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
+        # Tiered KV cache (Cluster 5): recognize multiple or alternating system prompts
+        sys_prompts = extract_system_prompts(req, messages)
+        meta = None
+        if sys_prompts:
+            sys_combined = "\n---\n".join(sys_prompts)
+            sys_hash = hashlib.sha256(sys_combined.encode("utf-8")).hexdigest()[:16]
+            with self.tiered_kv_lock:
+                if len(sys_prompts) > 1:
+                    self.tiered_kv_metrics["multi_system_requests"] += 1
+                is_switch = False
+                if self.last_system_prompt_hash is not None:
+                    if self.last_system_prompt_hash != sys_hash:
+                        self.tiered_kv_metrics["system_prompt_switches"] += 1
+                        is_switch = True
+                    else:
+                        self.tiered_kv_metrics["system_prompt_hits"] += 1
+                self.last_system_prompt_hash = sys_hash
+                if sys_hash not in self.system_prompt_branches:
+                    self.system_prompt_branches[sys_hash] = len(self.system_prompt_branches)
+                branch_id = self.system_prompt_branches[sys_hash]
+            meta = {
+                "system_prompt_hash": sys_hash,
+                "branch_id": branch_id,
+                "num_system_prompts": len(sys_prompts),
+                "is_multi_system": len(sys_prompts) > 1,
+                "is_switch": is_switch,
+            }
+            if req is not None and isinstance(req, dict) and "tiered_kv" in req:
+                req["tiered_kv"].update(meta)
+        self.last_tiered_kv = meta
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
@@ -4947,6 +5048,8 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        if "tiered_kv" not in (sampling or {}) and self.last_tiered_kv is not None:
+            sampling = {**(sampling or {}), "tiered_kv": self.last_tiered_kv}
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
