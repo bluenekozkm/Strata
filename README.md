@@ -4,7 +4,8 @@
 >
 > **This fork is work in progress.** It is being actively rebuilt, so a change can break something at any time, and
 > the documentation beyond the kept engine docs ([docs/DETAILS.md](docs/DETAILS.md),
-> [docs/AMD_HIP.md](docs/AMD_HIP.md), [docs/MULTI_GPU.md](docs/MULTI_GPU.md), [docs/NVFP4.md](docs/NVFP4.md), the
+> [docs/AMD_HIP.md](docs/AMD_HIP.md), [docs/MULTI_GPU.md](docs/MULTI_GPU.md), [docs/NVFP4.md](docs/NVFP4.md),
+> [docs/TIERED_KV.md](docs/TIERED_KV.md), the
 > [paper](docs/paper/Strata-Paper.pdf)) is thin. Weigh both before you rely on it.
 
 <h3 align="center">Run a state-of-the-art model on your own gaming PC</h3>
@@ -264,6 +265,20 @@ port. Point any client at `http://127.0.0.1:8080/v1` (the next section has the e
 
 The server never listens past loopback unless you give it an API key: `--api-key KEY` (or the `STRATA_API_KEY`
 environment variable) plus `--host 0.0.0.0` reaches the network. Every flag: `python3 serve/server.py --help`.
+
+#### Multi-prompt switching: Tiered KV Cache (optional)
+
+By default, the engine uses a standard linear KV cache. If you switch between different agents, tools, or multiple system prompts, enable the experimental tiered KV cache:
+
+```sh
+python3 serve/server.py --config strata-gyro-gyro-s.json --port 8080 --exp-tiered-kv
+```
+
+(Or put `"--exp-tiered-kv"` in `"args"` inside `strata-<name>.json`.)
+
+- **What it does**: Holds divergent system prompts and conversation branches in a multi-branch radix tree in host RAM (Tier 1). Switching between system prompts takes under 5 ms without recomputing prompt tokens or consuming GPU VRAM ([docs/TIERED_KV.md](docs/TIERED_KV.md)).
+- **Recommend Tier 1 (RAM only)**: Run `--exp-tiered-kv` without a path. This keeps all cache branches in host RAM, offering the fastest performance with zero SSD write wear. Cached sessions in RAM are volatile and reset when the server stops.
+- **Caution with Tier 2 (SSD)**: If given a directory path (`--exp-tiered-kv /path/to/cache`), the engine persists KV blocks to SSD via Direct I/O. Continuous SSD caching can accelerate drive wear (TBW degradation). Use Tier 2 only when cross-restart cache persistence is strictly necessary.
 
 ## Models
 

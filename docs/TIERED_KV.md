@@ -98,7 +98,7 @@ The Persistent Tiered KV Cache addresses this:
 
 - **Default Behavior**: Defaults to the standard **Linear Chain KVCache**. The Tiered KV Cache is an experimental feature enabled via the `--exp-tiered-kv` flag.
 - **Engine CLI options**:
-  - `--exp-tiered-kv [DIR]`: Enables experimental persistent tiered KV cache. If `DIR` is specified, blocks are persisted to SSD via Direct I/O; if omitted, runs in RAM-only mode (Tier 1 Radix tree in host RAM) and logs a warning that cached sessions are volatile and will be lost on engine restart.
+  - `--exp-tiered-kv [DIR]`: Enables experimental persistent tiered KV cache. If `DIR` is specified, blocks are persisted to SSD via Direct I/O; if omitted, runs in RAM-only mode (Tier 1 Radix tree in host RAM) and logs a warning that cached sessions are volatile and will be lost on engine restart. Tier 1 (RAM-only) is recommended for most workloads to prevent SSD wear.
   - `--kv-disk-cache DIR`: Persistent disk KV cache directory (implies `--exp-tiered-kv`).
   - `--kv-disk-budget N`: Maximum disk budget in MiB (default: 10240, 10 GiB).
   - `--kv-multi-system-prompt`: Enables multi-branch radix tree cache in resident `--serve` mode. Part of the experimental tiered KV cache suite (activates `--exp-tiered-kv`).
@@ -110,22 +110,30 @@ The Persistent Tiered KV Cache addresses this:
 
 ## Usage
 
-### 1. Running the Engine Directly
+### 1. Recommended Operating Mode & SSD Wear Caution
+
+> [!TIP]
+> **Use Tier 1 (Host RAM) for most workloads**: Running `--exp-tiered-kv` without a cache directory operates entirely in host memory. This delivers instant differential switching (< 5 ms) and zero prefill penalties across prompt branches without writing to disk.
+
+> [!WARNING]
+> **Tier 2 (NVMe SSD) writes consume SSD endurance**: Specifying an SSD directory (`--exp-tiered-kv <DIR>`) writes 128-token CAS blocks to disk via Direct I/O. Under heavy multi-turn conversational workloads or frequent session branching, this generates sustained disk write traffic that can degrade SSD lifespan (TBW). Use Tier 2 only when persistent caching across engine restarts is strictly required.
+
+### 2. Running the Engine Directly
 
 Start resident server with tiered disk cache enabled via `--exp-tiered-kv`:
 
 ```bash
-# Persistent SSD mode:
+# Recommended: Volatile RAM-only mode (Tier 1):
+strata --pack <pack_dir> --native <model.gguf> --serve \
+       --exp-tiered-kv
+
+# Or Persistent SSD mode (Tier 2, writes to disk):
 strata --pack <pack_dir> --native <model.gguf> --serve \
        --exp-tiered-kv /path/to/kv_cache \
        --kv-disk-budget 20480
-
-# Or volatile RAM-only mode (warns that data is lost on shutdown):
-strata --pack <pack_dir> --native <model.gguf> --serve \
-       --exp-tiered-kv
 ```
 
-### 2. Configuring via `serve/server.py`
+### 3. Configuring via `serve/server.py`
 
 In your server configuration file (e.g. `strata-config.json`):
 
@@ -134,21 +142,24 @@ In your server configuration file (e.g. `strata-config.json`):
   "args": [
     "--pack", "/path/to/pack",
     "--native", "/path/to/model.gguf",
-    "--exp-tiered-kv", "/var/cache/strata/kv",
-    "--kv-disk-budget", "20480"
+    "--exp-tiered-kv"
   ]
 }
 ```
 
 Or pass via server CLI directly:
 ```bash
-python3 -m serve.server --config strata-config.json --exp-tiered-kv /var/cache/strata/kv
+# Recommended RAM-only mode:
+python3 -m serve.server --config strata-config.json --exp-tiered-kv
+
+# Or Persistent SSD mode:
+python3 -m serve.server --config strata-config.json --exp-tiered-kv /var/cache/strata/kv --kv-disk-budget 20480
 ```
 
 Requests to `/v1/chat/completions` or `/v1/messages` with varying system prompts automatically benefit from
 multi-branch caching and fast prefill bypass.
 
-### 3. Monitoring Telemetry
+### 4. Monitoring Telemetry
 
 Query cache hit rate and branch metrics:
 
